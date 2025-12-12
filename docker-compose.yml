@@ -1,0 +1,84 @@
+services:
+
+  # 1. Trading Bot (Main Application)
+  bot:
+    build: .
+    container_name: crypto_bot
+    command: python -m src.main
+    volumes:
+      - ./:/app
+    depends_on:
+      - db
+    environment:
+      - PYTHONUNBUFFERED=1
+      - QUESTDB_HOST=db
+      - PYTHONPATH=/app
+      - RISK_EQUITY=${RISK_EQUITY:-10000}
+      - RISK_PER_TRADE=${RISK_PER_TRADE:-0.01}
+      - RISK_MAX_LEVERAGE=${RISK_MAX_LEVERAGE:-2.0}
+    restart: unless-stopped
+
+  # 2. The Generic Worker (Use this for Ingestion, Testing, etc.)
+  worker:
+    build: .
+    container_name: crypto_worker
+    command: tail -f /dev/null
+    volumes:
+      - ./:/app
+    depends_on:
+      - db
+    environment:
+      - PYTHONUNBUFFERED=1
+      - QUESTDB_HOST=db
+      - PYTHONPATH=/app
+
+  # 3. The Visualization Tool
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - db
+    environment:
+      - GF_INSTALL_PLUGINS=questdb-questdb-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+
+  # 4. The Database
+  db:
+    image: questdb/questdb:latest
+    restart: always
+    container_name: questdb
+    ports:
+      - "9000:9000"
+      - "9009:9009"
+      - "8812:8812"
+    volumes:
+      - ./data/db:/root/.questdb/db
+
+  # 5. The Research Station (Jupyter Lab)
+  jupyter:
+    build: .
+    container_name: crypto_jupyter
+    user: root
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./:/app
+    environment:
+      - QUESTDB_HOST=db
+      - PYTHONPATH=/app
+      - JUPYTER_TOKEN=mysecretpassword
+    command: >
+      jupyter lab
+      --ip=0.0.0.0
+      --port=8888
+      --no-browser
+      --allow-root
+    depends_on:
+      - db
+
+volumes:
+  grafana_data:
