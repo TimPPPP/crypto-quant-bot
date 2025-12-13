@@ -1,6 +1,7 @@
 import os
 import time
 import logging
+import threading
 
 # Hyperliquid SDK is optional. If it's not installed the code will run in
 # a "mock" mode that returns a small fallback universe. This prevents
@@ -22,16 +23,19 @@ MIN_VOLUME_USD = float(os.getenv('MIN_VOLUME_USD', 1_000_000))
 BUFFER_SIZE = int(os.getenv('UNIVERSE_BUFFER', 30))
 CACHE_TTL_SECONDS = int(os.getenv('UNIVERSE_CACHE_TTL', 3600))  # 1 hour default
 
-# Cache for universe data
+# Thread-safe cache for universe data
 _universe_cache = {
     'data': None,
     'timestamp': 0
 }
+_cache_lock = threading.Lock()
 
 
 def get_liquid_universe(top_n: int = 50, use_buffer: bool = False, force_refresh: bool = False):
     """
     Fetches the top liquid assets from Hyperliquid On-Chain Data.
+
+    Thread-safe implementation with caching.
 
     Args:
         top_n: Number of primary assets to select (default 50).
@@ -43,12 +47,22 @@ def get_liquid_universe(top_n: int = 50, use_buffer: bool = False, force_refresh
     """
     global _universe_cache
 
-    # Check cache
+    # Quick check without lock (double-checked locking pattern)
     cache_age = time.time() - _universe_cache['timestamp']
     if not force_refresh and _universe_cache['data'] is not None and cache_age < CACHE_TTL_SECONDS:
         logger.debug(f"Using cached universe (age: {cache_age:.0f}s)")
         all_symbols = _universe_cache['data']
-    else:
+        limit = top_n + BUFFER_SIZE if use_buffer else top_n
+        return all_symbols[:limit]
+
+    # Acquire lock for cache update
+    with _cache_lock:
+        # Re-check cache after acquiring lock (another thread may have updated it)
+        cache_age = time.time() - _universe_cache['timestamp']
+        if not force_refresh and _universe_cache['data'] is not None and cache_age < CACHE_TTL_SECONDS:
+            logger.debug(f"Using cached universe (age: {cache_age:.0f}s)")
+            all_symbols = _universe_cache['data']
+        else:
             # If the Hyperliquid SDK is unavailable, provide a safe fallback so
             # the bot can run in mock mode. Prefer an explicit env var override.
             if not HYPERLIQUID_AVAILABLE:
@@ -141,9 +155,10 @@ def get_liquid_universe(top_n: int = 50, use_buffer: bool = False, force_refresh
 
 
 def clear_universe_cache():
-    """Clear the universe cache."""
+    """Clear the universe cache (thread-safe)."""
     global _universe_cache
-    _universe_cache = {'data': None, 'timestamp': 0}
+    with _cache_lock:
+        _universe_cache = {'data': None, 'timestamp': 0}
     logger.info("Universe cache cleared")
 
 

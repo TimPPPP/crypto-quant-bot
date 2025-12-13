@@ -1,89 +1,90 @@
-import sys
+# src/collectors/validate_gaps.py
+
 import os
+import sys
 import pandas as pd
 import requests
 
 # --- PATH SETUP ---
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+
 from src.utils.universe import get_liquid_universe
+from src.backtest.data_segmenter import validate_data_continuity  # canonical rule
+from src.backtest import config_backtest as cfg                  # MAX_DATA_GAP_MINS, etc.
 
 # --- CONFIGURATION ---
-QUESTDB_HOST = os.getenv('QUESTDB_HOST', 'localhost')
-HTTP_PORT = 9000
+QUESTDB_HOST = os.getenv("QUESTDB_HOST", "localhost")
+HTTP_PORT = int(os.getenv("QUESTDB_HTTP_PORT", "9000"))
 URL = f"http://{QUESTDB_HOST}:{HTTP_PORT}/exec"
 
-def check_table(symbol, table_name, interval_sec):
+
+def check_table(symbol: str, table_name: str) -> str:
     """
-    Checks a specific table for gaps and duplicates.
+    Checks a specific QuestDB table for:
+    - emptiness
+    - duplicate timestamps
+    - fatal continuity gaps using the backtest's canonical rule (MAX_DATA_GAP_MINS)
+
+    Returns a short status string for console reporting.
     """
-    # 1. Fetch Timestamp Column
     query = f"SELECT timestamp FROM {table_name} WHERE symbol = '{symbol}' ORDER BY timestamp ASC"
-    
+
     try:
-        r = requests.get(URL, params={'query': query})
-        
-        # Handle non-existent table or DB errors
+        r = requests.get(URL, params={"query": query}, timeout=30)
+
         if r.status_code != 200:
             if "table does not exist" in r.text:
                 return "⚪ Missing Table"
-            return f"❌ DB Error"
+            return "❌ DB Error"
 
         data = r.json()
-        if 'dataset' not in data or not data['dataset']:
+        if "dataset" not in data or not data["dataset"]:
             return "⚪ Empty"
 
-        # 2. Parse Data
-        df = pd.DataFrame(data['dataset'], columns=['timestamp'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        
-        # 3. Check Duplicates
+        df = pd.DataFrame(data["dataset"], columns=["timestamp"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        df = df.dropna(subset=["timestamp"])
+
+        if df.empty:
+            return "⚪ Empty"
+
+        # Duplicate check
         start_len = len(df)
-        df = df.drop_duplicates(subset=['timestamp'])
-        if start_len != len(df):
+        df = df.drop_duplicates(subset=["timestamp"])
+        if len(df) != start_len:
             return "⚠️ Duplicates"
-        
-        # 4. Check Gaps
-        # We define a "Gap" as missing a whole interval (interval * 1.5 allows for small jitter)
-        df['delta'] = df['timestamp'].diff().dt.total_seconds()
-        gaps = df[df['delta'] > (interval_sec * 1.5)]
-        
-        if not gaps.empty:
-            return f"❌ {len(gaps)} Gaps"
-        
+
+        # Canonical continuity check (same rule as backtest)
+        ts_df = df.set_index("timestamp").sort_index()
+        try:
+            validate_data_continuity(ts_df)
+        except ValueError:
+            return f"❌ Gap > {cfg.MAX_DATA_GAP_MINS}m"
+
         return "✅ OK"
 
     except Exception as e:
-        return f"❌ Err: {str(e)[:10]}"
+        return f"❌ Err: {str(e)[:20]}"
 
-def run_full_scan():
-    print("🏥 Starting Complete Data Lake Check (1H, 1M, Funding)...")
-    
-    # 1. Get Universe
-    symbols = get_liquid_universe(top_n=50)
-    
-    # 2. Print Header
-    # Formats the table nicely
-    print(f"\n{'SYMBOL':<8} | {'1-HOUR (Price)':<18} | {'FUNDING (Rate)':<18} | {'1-MIN (Price)':<18}")
-    print("-" * 70)
-    
-    # 3. Scan Loop
+
+def run_full_scan(top_n: int = 50) -> None:
+    print("🏥 Starting Data Lake Check (1M Candles + Funding)...")
+
+    symbols = get_liquid_universe(top_n=top_n)
+
+    print(f"\n{'SYMBOL':<10} | {'1-MIN (Price)':<18} | {'FUNDING (Rate)':<18}")
+    print("-" * 55)
+
     for sym in symbols:
-        # Check 1H Candles (Interval: 3600s)
-        status_1h = check_table(sym, 'candles_1h', 3600)
-        
-        # Check Funding History (Interval: 3600s)
-        # Note: Funding sometimes has slight jitter, but should never be > 1.5 hours apart
-        status_funding = check_table(sym, 'funding_history', 3600)
-        
-        # Check 1M Candles (Interval: 60s)
-        status_1m = check_table(sym, 'candles_1m', 60)
-        
-        print(f"{sym:<8} | {status_1h:<18} | {status_funding:<18} | {status_1m:<18}")
+        status_1m = check_table(sym, "candles_1m")
+        status_funding = check_table(sym, "funding_history")
+        print(f"{sym:<10} | {status_1m:<18} | {status_funding:<18}")
 
-    print("-" * 70)
-    print("⚪ Empty = You haven't run the ingestion for this table yet.")
-    print("⚠️ Duplicates = Run 'VACUUM PARTITIONS [table_name];' in SQL.")
-    print("❌ Gaps = Data missing. Re-run ingestion or check logs.")
+    print("-" * 55)
+    print("⚪ Empty = You haven't ingested this symbol/table yet.")
+    print("⚠️ Duplicates = Consider 'VACUUM PARTITIONS <table>;' in QuestDB.")
+    print(f"❌ Gap > {cfg.MAX_DATA_GAP_MINS}m = Fatal gap by backtest rule (fix before backtesting).")
+
 
 if __name__ == "__main__":
     run_full_scan()

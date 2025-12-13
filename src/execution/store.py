@@ -2,14 +2,21 @@ import json
 import os
 import shutil
 import sys
+import fcntl
 import logging
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional, Any
 from collections import deque
+from contextlib import contextmanager
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("StateManager")
+
+
+class StateCorruptionError(Exception):
+    """Raised when state file is corrupted and cannot be recovered."""
+    pass
 
 
 class StateManager:
@@ -32,10 +39,27 @@ class StateManager:
         """
         self.filepath = filepath
         self.backup_filepath = filepath + ".backup"
+        self.lock_filepath = filepath + ".lock"
         self._cache: Optional[Dict] = None
         self._cache_dirty = False
 
         self._ensure_dir()
+
+    @contextmanager
+    def _file_lock(self):
+        """
+        Context manager for file-based locking to ensure atomic operations.
+        Uses fcntl for POSIX systems.
+        """
+        lock_file = None
+        try:
+            lock_file = open(self.lock_filepath, 'w')
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            if lock_file:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                lock_file.close()
 
     def _ensure_dir(self):
         """Ensure the state directory exists."""
@@ -93,7 +117,7 @@ class StateManager:
                 }
 
             record = {
-                'last_updated': datetime.utcnow().isoformat(),
+                'last_updated': datetime.now(timezone.utc).isoformat(),
                 'pair_id': pair_id,
                 'trade': trade_data,
                 'kalman_state': kf_state,
@@ -147,7 +171,12 @@ class StateManager:
             return {}
 
     def _handle_corruption(self):
-        """Handle corrupted state file."""
+        """
+        Handle corrupted state file.
+
+        Raises:
+            StateCorruptionError: When state cannot be recovered from backup
+        """
         corrupt_path = self.filepath + ".CORRUPT"
 
         if os.path.exists(self.filepath):
@@ -166,15 +195,12 @@ class StateManager:
                 pass
 
         error_msg = (
-            f"\n{'='*50}\n"
-            f"CRITICAL ERROR: State file is CORRUPT!\n"
-            f"Corrupted file moved to: {corrupt_path}\n"
-            f"The bot has stopped to prevent 'Zombie Positions'.\n"
-            f"Please manually verify your exchange positions.\n"
-            f"{'='*50}\n"
+            f"CRITICAL ERROR: State file is CORRUPT! "
+            f"Corrupted file moved to: {corrupt_path}. "
+            f"Please manually verify your exchange positions."
         )
         logger.critical(error_msg)
-        sys.exit(1)
+        raise StateCorruptionError(error_msg)
 
     def get_position(self, pair_id: str) -> Optional[Dict]:
         """
@@ -234,7 +260,7 @@ class StateManager:
 
         self._create_backup()
         current_state[pair_id].update(updates)
-        current_state[pair_id]['last_updated'] = datetime.utcnow().isoformat()
+        current_state[pair_id]['last_updated'] = datetime.now(timezone.utc).isoformat()
         self._atomic_write(current_state)
 
         # Update cache
@@ -244,23 +270,24 @@ class StateManager:
 
     def _atomic_write(self, data: Dict):
         """
-        Write data atomically using temp file + rename.
+        Write data atomically using temp file + rename with file locking.
 
         Args:
             data: Data to write
         """
         temp_path = self.filepath + ".tmp"
-        try:
-            with open(temp_path, 'w') as f:
-                json.dump(data, f, indent=2)
+        with self._file_lock():
+            try:
+                with open(temp_path, 'w') as f:
+                    json.dump(data, f, indent=2)
 
-            os.replace(temp_path, self.filepath)
+                os.replace(temp_path, self.filepath)
 
-        except Exception as e:
-            logger.error(f"Atomic write failed: {e}")
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-            raise
+            except Exception as e:
+                logger.error(f"Atomic write failed: {e}")
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+                raise
 
     def hydrate_kalman_model(self, kf_instance: Any, pair_id: str) -> bool:
         """

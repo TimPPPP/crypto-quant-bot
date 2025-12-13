@@ -1,8 +1,11 @@
 import os
 import time
+import asyncio
 import logging
 from typing import Dict, Optional, Tuple, List
 from decimal import Decimal, ROUND_DOWN
+from datetime import datetime, timezone
+from collections import deque
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("ExchangeClient")
@@ -20,8 +23,8 @@ except ImportError:
 
 
 # Size precision per asset (Hyperliquid specific)
-# These are the maximum decimal places allowed for order sizes
-SIZE_DECIMALS = {
+# Fallback values - will be dynamically updated from API when available
+_SIZE_DECIMALS_FALLBACK = {
     'BTC': 4,
     'ETH': 3,
     'SOL': 2,
@@ -50,6 +53,74 @@ SIZE_DECIMALS = {
 }
 DEFAULT_SIZE_DECIMALS = 2
 
+# Dynamic cache for size decimals (populated from API)
+_size_decimals_cache = {}
+_size_decimals_loaded = False
+
+
+class RateLimiter:
+    """
+    Token bucket rate limiter for API calls.
+
+    Tracks request timestamps and ensures we stay within rate limits.
+    """
+
+    def __init__(self, max_requests: int = 10, window_seconds: float = 1.0):
+        """
+        Initialize rate limiter.
+
+        Args:
+            max_requests: Maximum requests allowed in the time window
+            window_seconds: Time window in seconds
+        """
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.requests: deque = deque()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self):
+        """
+        Acquire permission to make a request.
+        Blocks if rate limit would be exceeded.
+        """
+        async with self._lock:
+            now = time.time()
+
+            # Remove old requests outside the window
+            while self.requests and self.requests[0] < now - self.window_seconds:
+                self.requests.popleft()
+
+            # If at limit, wait until oldest request expires
+            if len(self.requests) >= self.max_requests:
+                sleep_time = self.requests[0] + self.window_seconds - now
+                if sleep_time > 0:
+                    await asyncio.sleep(sleep_time)
+                    # Clean up again after sleeping
+                    now = time.time()
+                    while self.requests and self.requests[0] < now - self.window_seconds:
+                        self.requests.popleft()
+
+            # Record this request
+            self.requests.append(time.time())
+
+    def sync_acquire(self):
+        """
+        Synchronous version for non-async contexts.
+        """
+        now = time.time()
+
+        # Remove old requests
+        while self.requests and self.requests[0] < now - self.window_seconds:
+            self.requests.popleft()
+
+        # If at limit, wait
+        if len(self.requests) >= self.max_requests:
+            sleep_time = self.requests[0] + self.window_seconds - now
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+        self.requests.append(time.time())
+
 
 class ExchangeClient:
     """
@@ -66,6 +137,8 @@ class ExchangeClient:
     DEFAULT_SLIPPAGE = 0.02          # 2% default slippage tolerance
     DEFAULT_MAX_RETRIES = 3          # Retry attempts for failed orders
     DEFAULT_RETRY_DELAY = 1.0        # Seconds between retries
+    DEFAULT_RATE_LIMIT = 10          # Max requests per second
+    DEFAULT_RATE_WINDOW = 1.0        # Rate limit window in seconds
 
     def __init__(
         self,
@@ -73,7 +146,8 @@ class ExchangeClient:
         account_address: str = None,
         base_url: str = None,
         slippage: float = None,
-        max_retries: int = None
+        max_retries: int = None,
+        rate_limit: int = None
     ):
         """
         Initialize Exchange Client.
@@ -84,6 +158,7 @@ class ExchangeClient:
             base_url: API URL (defaults to mainnet)
             slippage: Slippage tolerance as decimal (e.g., 0.02 for 2%)
             max_retries: Max retry attempts for failed orders
+            rate_limit: Max API requests per second
         """
         self.private_key = private_key or os.getenv("HL_PRIVATE_KEY")
         self.account_address = account_address or os.getenv("HL_ACCOUNT_ADDRESS")
@@ -93,6 +168,13 @@ class ExchangeClient:
         self.slippage = slippage or float(os.getenv('EXCHANGE_SLIPPAGE', self.DEFAULT_SLIPPAGE))
         self.max_retries = max_retries or int(os.getenv('EXCHANGE_MAX_RETRIES', self.DEFAULT_MAX_RETRIES))
         self.retry_delay = self.DEFAULT_RETRY_DELAY
+
+        # Rate limiting
+        rate_limit = rate_limit or int(os.getenv('EXCHANGE_RATE_LIMIT', self.DEFAULT_RATE_LIMIT))
+        self.rate_limiter = RateLimiter(
+            max_requests=rate_limit,
+            window_seconds=self.DEFAULT_RATE_WINDOW
+        )
 
         # Order tracking
         self.last_order_ids: List[str] = []
@@ -132,6 +214,56 @@ class ExchangeClient:
                 logger.error(f"Failed to connect to Exchange: {e}")
                 raise
 
+    def _load_size_decimals(self):
+        """
+        Load size decimal precision from Hyperliquid API.
+
+        Populates the global _size_decimals_cache from the meta endpoint.
+        Falls back to hardcoded values if API is unavailable.
+        """
+        global _size_decimals_cache, _size_decimals_loaded
+
+        if _size_decimals_loaded:
+            return
+
+        if not self.info:
+            logger.warning("Info API not available, using fallback size decimals")
+            _size_decimals_cache = _SIZE_DECIMALS_FALLBACK.copy()
+            _size_decimals_loaded = True
+            return
+
+        try:
+            meta = self.info.meta()
+            universe = meta.get('universe', [])
+
+            for asset in universe:
+                name = asset.get('name')
+                sz_decimals = asset.get('szDecimals')
+
+                if name and sz_decimals is not None:
+                    _size_decimals_cache[name] = int(sz_decimals)
+
+            _size_decimals_loaded = True
+            logger.info(f"Loaded size decimals for {len(_size_decimals_cache)} assets from API")
+
+        except Exception as e:
+            logger.warning(f"Failed to load size decimals from API: {e}, using fallback")
+            _size_decimals_cache = _SIZE_DECIMALS_FALLBACK.copy()
+            _size_decimals_loaded = True
+
+    def get_size_decimals(self, coin: str) -> int:
+        """
+        Get size decimal precision for a coin.
+
+        Args:
+            coin: Asset symbol (e.g., 'BTC', 'ETH')
+
+        Returns:
+            Number of decimal places for size
+        """
+        self._load_size_decimals()
+        return _size_decimals_cache.get(coin, _SIZE_DECIMALS_FALLBACK.get(coin, DEFAULT_SIZE_DECIMALS))
+
     def round_size(self, coin: str, size: float) -> float:
         """
         Round size to exchange-accepted precision.
@@ -143,7 +275,7 @@ class ExchangeClient:
         Returns:
             Rounded size value
         """
-        decimals = SIZE_DECIMALS.get(coin, DEFAULT_SIZE_DECIMALS)
+        decimals = self.get_size_decimals(coin)
 
         # Use Decimal for precise rounding
         d = Decimal(str(size))
@@ -241,9 +373,12 @@ class ExchangeClient:
             'reduce_only': False
         }
 
-        # Execute with retry
+        # Execute with retry and rate limiting
         for attempt in range(self.max_retries):
             try:
+                # Apply rate limiting before API call
+                self.rate_limiter.sync_acquire()
+
                 responses = self.exchange.bulk_orders([order_a, order_b])
                 success = self._verify_batch_fill(responses, pair, order_a, order_b)
 
@@ -356,6 +491,9 @@ class ExchangeClient:
         }
 
         try:
+            # Apply rate limiting before API call
+            self.rate_limiter.sync_acquire()
+
             res = self.exchange.order(
                 order['coin'],
                 order['is_buy'],
@@ -397,11 +535,11 @@ class ExchangeClient:
                     else:
                         return price * (1 - emergency_slippage)
         except Exception as e:
-            logger.warning(f"Price fetch failed for emergency close: {e}")
+            logger.error(f"Price fetch failed for emergency close: {e}")
 
-        # Fallback to extreme but reasonable prices
-        logger.warning(f"Using fallback emergency price for {coin}")
-        return 999999.0 if is_buy else 0.01
+        # CRITICAL: Cannot determine safe price - raise exception rather than use dangerous fallback
+        logger.critical(f"CANNOT DETERMINE SAFE EMERGENCY PRICE FOR {coin}")
+        raise ValueError(f"Unable to fetch safe emergency price for {coin}. Manual intervention required.")
 
     def _log_execution(
         self,

@@ -59,6 +59,17 @@ class FeatureEngineer:
                 logger.error(f"Key Error (Check QuestDB columns): {e}")
                 return pd.DataFrame()
 
+            # Minimum data requirements
+            WINDOW_30D = 24 * 30  # 720 hours
+            MIN_REQUIRED_ROWS = WINDOW_30D + 10  # Need window + buffer
+
+            if len(closes) < MIN_REQUIRED_ROWS:
+                logger.error(
+                    f"Insufficient data: {len(closes)} rows, need {MIN_REQUIRED_ROWS}. "
+                    f"Increase lookback_days in load_data()."
+                )
+                return pd.DataFrame()
+
             # Validate prices before log transform
             if (closes <= 0).any().any():
                 logger.warning("Found non-positive prices, replacing with NaN")
@@ -83,8 +94,6 @@ class FeatureEngineer:
             market_ret = market_ret.fillna(0)
 
             features = pd.DataFrame(index=closes.columns)
-
-            WINDOW_30D = 24 * 30
 
             # FEATURE 1: BETA (Structural Correlation)
             cov = returns.rolling(WINDOW_30D).cov(market_ret)

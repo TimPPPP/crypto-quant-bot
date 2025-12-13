@@ -37,11 +37,30 @@ class DataLoader:
     - Connection pooling with retries
     - UTC timezone handling
     - Proper fill logic for missing data
+    - Health check for connection validation
     """
 
     def __init__(self, universe):
         self.universe = list(universe) if not isinstance(universe, list) else universe
         self.session = create_session()
+
+    def health_check(self) -> bool:
+        """
+        Check if QuestDB connection is healthy.
+
+        Returns:
+            True if connection is healthy, False otherwise.
+        """
+        try:
+            r = self.session.get(
+                QUESTDB_QUERY_URL,
+                params={'query': 'SELECT 1'},
+                timeout=5
+            )
+            return r.status_code == 200
+        except Exception as e:
+            logger.warning(f"Health check failed: {e}")
+            return False
 
     def _query_questdb(self, query):
         """Execute a query against QuestDB with connection pooling."""

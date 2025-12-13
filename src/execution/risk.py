@@ -263,9 +263,18 @@ class RiskEngine:
 
         return False
 
+    def is_kill_switch_triggered(self) -> bool:
+        """
+        Check if kill switch would be triggered (no side effects).
+
+        Returns:
+            True if drawdown exceeds limit
+        """
+        return self.get_current_drawdown() > self.DRAWDOWN_LIMIT
+
     def check_kill_switch(self) -> bool:
         """
-        Check if emergency shutdown should be triggered.
+        Check if emergency shutdown should be triggered and log if so.
 
         Uses peak drawdown (more conservative than drawdown from start).
 
@@ -283,7 +292,11 @@ class RiskEngine:
         return False
 
     def get_status(self) -> dict:
-        """Get current risk status summary."""
+        """
+        Get current risk status summary.
+
+        Note: Uses is_kill_switch_triggered() to avoid logging side effects.
+        """
         return {
             'current_equity': self.current_equity,
             'peak_equity': self.peak_equity,
@@ -293,7 +306,7 @@ class RiskEngine:
             'active_positions': len(self.active_positions),
             'max_positions': self.max_positions,
             'coin_exposure': dict(self.coin_exposure),
-            'kill_switch_triggered': self.check_kill_switch()
+            'kill_switch_triggered': self.is_kill_switch_triggered()
         }
 
 

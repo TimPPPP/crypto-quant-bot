@@ -1,14 +1,16 @@
 import asyncio
 import os
+import signal
 import logging
 import sys
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
+from typing import Set
 
 # Import Modules
 from src.utils.universe import get_liquid_universe
-from src.execution.store import StateManager
+from src.execution.store import StateManager, StateCorruptionError
 from src.execution.exchange_client import ExchangeClient
 from src.execution.risk import RiskEngine
 from src.execution.executor import TradeExecutor
@@ -29,6 +31,17 @@ DEFAULT_EQUITY = float(os.getenv('RISK_EQUITY', 10000.0))
 DEFAULT_RISK_PER_TRADE = float(os.getenv('RISK_PER_TRADE', 0.01))
 DEFAULT_MAX_LEVERAGE = float(os.getenv('RISK_MAX_LEVERAGE', 2.0))
 MAX_CONSECUTIVE_ERRORS = int(os.getenv('MAX_CONSECUTIVE_ERRORS', 5))
+
+# Timing constants (seconds)
+TICK_LOOP_SLEEP_INTERVAL = int(os.getenv('TICK_LOOP_INTERVAL', 30))
+TICK_LOOP_POST_PROCESS_SLEEP = int(os.getenv('TICK_LOOP_POST_SLEEP', 65))
+TICK_LOOP_ERROR_SLEEP = int(os.getenv('TICK_LOOP_ERROR_SLEEP', 60))
+RISK_LOOP_INTERVAL = int(os.getenv('RISK_LOOP_INTERVAL', 10))
+SCANNER_LOOP_INTERVAL = int(os.getenv('SCANNER_LOOP_INTERVAL', 86400))
+
+# Exit thresholds
+EXIT_Z_THRESHOLD_LONG = float(os.getenv('EXIT_Z_THRESHOLD_LONG', -0.5))
+EXIT_Z_THRESHOLD_SHORT = float(os.getenv('EXIT_Z_THRESHOLD_SHORT', 0.5))
 
 # Top level function for multiprocessing (Pickle requirement)
 def _run_heavy_scan_job():
@@ -54,16 +67,33 @@ class TradingBot:
         # 2. Strategy Memory
         self.active_pairs = {}
         self.retiring_pairs = {}
-        self.pending_orders = set()  # Race condition lock
+        self._pending_orders: Set[str] = set()
+        self._pending_orders_lock = asyncio.Lock()
 
         # 3. Execution State
         self.is_running = True
         self.executor = ProcessPoolExecutor(max_workers=1)
         self.consecutive_errors = 0  # Circuit breaker counter
+        self._shutdown_event = asyncio.Event()
 
-        # 4. Load State and Reconcile
+        # 4. Setup signal handlers
+        self._setup_signal_handlers()
+
+        # 5. Load State and Reconcile
         self._restore_state()
         self._reconcile_with_exchange()
+
+    def _setup_signal_handlers(self):
+        """Setup graceful shutdown signal handlers."""
+        loop = asyncio.get_event_loop()
+
+        def signal_handler(sig):
+            logger.info(f"Received signal {sig.name}, initiating graceful shutdown...")
+            self._shutdown_event.set()
+            self.is_running = False
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, lambda s=sig: signal_handler(s))
 
     def _restore_state(self):
         """Restore positions and Kalman states from disk."""
@@ -114,45 +144,45 @@ class TradingBot:
             logger.error(f"Reconciliation error: {e}")
 
     async def run_scanner_process(self):
-        logger.info("🔎 STARTING DAILY SCAN (Background Process)...")
+        logger.info("STARTING DAILY SCAN (Background Process)...")
         loop = asyncio.get_running_loop()
         try:
             new_pairs_df = await loop.run_in_executor(self.executor, _run_heavy_scan_job)
             if new_pairs_df is None or new_pairs_df.empty:
-                logger.warning("⚠️ Scanner found no pairs. Keeping existing strategy.")
+                logger.warning("Scanner found no pairs. Keeping existing strategy.")
                 return
 
             new_pair_ids = set(new_pairs_df['pair'].tolist())
             current_ids = set(self.active_pairs.keys())
-            
+
             for pair in new_pair_ids:
                 if pair not in current_ids:
-                    logger.info(f"✨ NEW PAIR FOUND: {pair}")
+                    logger.info(f"NEW PAIR FOUND: {pair}")
                     kf = KalmanFilterRegime()
                     kf.latest_z = 0.0
                     self.active_pairs[pair] = kf
-            
+
             for pair in current_ids:
                 if pair not in new_pair_ids:
                     pos = self.state_manager.get_position(pair)
                     if pos and pos.get('is_active'):
-                        logger.info(f"👵 RETIRING PAIR: {pair}")
+                        logger.info(f"RETIRING PAIR: {pair}")
                         self.retiring_pairs[pair] = self.active_pairs[pair]
                     else:
-                        logger.info(f"🗑️ REMOVING PAIR: {pair}")
+                        logger.info(f"REMOVING PAIR: {pair}")
                     if pair in self.active_pairs:
                         del self.active_pairs[pair]
         except Exception as e:
-            logger.error(f"❌ Scanner Process Failed: {e}")
+            logger.error(f"Scanner Process Failed: {e}")
 
     async def scanner_loop(self):
-        logger.info("📅 Scanner Loop Started.")
+        logger.info("Scanner Loop Started (daily scan).")
         while self.is_running:
             try:
                 await self.run_scanner_process()
             except Exception as e:
                 logger.error(f"Scanner Loop Error: {e}")
-            await asyncio.sleep(86400)
+            await asyncio.sleep(SCANNER_LOOP_INTERVAL)
 
     async def tick_loop(self):
         logger.info("Tick Loop Started (Swing Mode: Hourly).")
@@ -161,7 +191,7 @@ class TradingBot:
                 # Use UTC time for consistency across timezones
                 now_utc = datetime.now(timezone.utc)
                 if now_utc.minute != 0:
-                    await asyncio.sleep(30)
+                    await asyncio.sleep(TICK_LOOP_SLEEP_INTERVAL)
                     continue
 
                 all_prices = self.exchange.info.all_mids()
@@ -193,9 +223,9 @@ class TradingBot:
                         # Exit when spread reverts past the zero line
                         # SHORT_SPREAD (entry_z > 0): exit when z drops below threshold
                         # LONG_SPREAD (entry_z < 0): exit when z rises above threshold
-                        if entry_z > 0 and current_z < 0.5:
+                        if entry_z > 0 and current_z < EXIT_Z_THRESHOLD_SHORT:
                             should_exit = True
-                        if entry_z < 0 and current_z > -0.5:
+                        if entry_z < 0 and current_z > EXIT_Z_THRESHOLD_LONG:
                             should_exit = True
 
                         if should_exit:
@@ -205,7 +235,7 @@ class TradingBot:
                 self.consecutive_errors = 0
 
                 # Sleep past the minute boundary to avoid double processing
-                await asyncio.sleep(65)
+                await asyncio.sleep(TICK_LOOP_POST_PROCESS_SLEEP)
 
             except Exception as e:
                 self.consecutive_errors += 1
@@ -217,7 +247,7 @@ class TradingBot:
                     self.shutdown()
                     break
 
-                await asyncio.sleep(60)
+                await asyncio.sleep(TICK_LOOP_ERROR_SLEEP)
                 
     async def risk_loop(self):
         logger.info("Risk Loop Started.")
@@ -251,18 +281,18 @@ class TradingBot:
                                 await self.execute_exit(pair, pos['trade'], py, px, "STOP LOSS")
             except Exception as e:
                 logger.error(f"Risk Loop Error: {e}")
-            await asyncio.sleep(10)
+            await asyncio.sleep(RISK_LOOP_INTERVAL)
 
     async def execute_entry(self, pair, signal_data, price_a, price_b):
         """Execute entry for a pair trade."""
-        # Race condition check
-        if pair in self.pending_orders:
-            return
-        if self.state_manager.get_position(pair):
-            return
-
-        # Lock
-        self.pending_orders.add(pair)
+        # Thread-safe race condition check using async lock
+        async with self._pending_orders_lock:
+            if pair in self._pending_orders:
+                return
+            if self.state_manager.get_position(pair):
+                return
+            # Mark as pending
+            self._pending_orders.add(pair)
 
         try:
             z_score = signal_data['z_score']
@@ -313,15 +343,16 @@ class TradingBot:
 
         finally:
             # Always release lock
-            if pair in self.pending_orders:
-                self.pending_orders.remove(pair)
+            async with self._pending_orders_lock:
+                self._pending_orders.discard(pair)
 
     async def execute_exit(self, pair, trade_data, price_a, price_b, reason="Exit"):
         """Execute exit for a pair trade."""
-        # Race condition check
-        if pair in self.pending_orders:
-            return
-        self.pending_orders.add(pair)
+        # Thread-safe race condition check using async lock
+        async with self._pending_orders_lock:
+            if pair in self._pending_orders:
+                return
+            self._pending_orders.add(pair)
 
         try:
             logger.info(f"{reason}: Closing {pair}...")
@@ -345,8 +376,8 @@ class TradingBot:
                     del self.retiring_pairs[pair]
                     logger.info(f"Retired pair {pair} removed.")
         finally:
-            if pair in self.pending_orders:
-                self.pending_orders.remove(pair)
+            async with self._pending_orders_lock:
+                self._pending_orders.discard(pair)
 
     async def start(self):
         logger.info("SYSTEM STARTUP INITIATED")
@@ -366,29 +397,45 @@ class TradingBot:
             self.shutdown()
 
     def shutdown(self):
+        """Gracefully shutdown the trading bot."""
+        if not self.is_running:
+            return  # Already shutting down
+
         logger.info("SHUTDOWN SIGNAL RECEIVED.")
         self.is_running = False
 
         # Log final state
-        status = self.risk_engine.get_status()
-        logger.info(f"Final equity: ${status['current_equity']:,.2f}")
-        logger.info(f"Drawdown from peak: {status['drawdown_from_peak']*100:.2f}%")
-        logger.info(f"Active positions at shutdown: {status['active_positions']}")
+        try:
+            status = self.risk_engine.get_status()
+            logger.info(f"Final equity: ${status['current_equity']:,.2f}")
+            logger.info(f"Drawdown from peak: {status['drawdown_from_peak']*100:.2f}%")
+            logger.info(f"Active positions at shutdown: {status['active_positions']}")
+        except Exception as e:
+            logger.error(f"Error getting final status: {e}")
 
         # Kill the background process pool
-        self.executor.shutdown(wait=False, cancel_futures=True)
+        try:
+            self.executor.shutdown(wait=False, cancel_futures=True)
+            logger.info("Process pool killed.")
+        except Exception as e:
+            logger.error(f"Error shutting down executor: {e}")
 
-        logger.info("Process pool killed. Exiting.")
-        sys.exit(0)
+        logger.info("Shutdown complete.")
+
 
 if __name__ == "__main__":
-    bot = TradingBot()
     try:
+        bot = TradingBot()
         asyncio.run(bot.start())
+    except StateCorruptionError as e:
+        logger.critical(f"State corruption detected: {e}")
+        logger.critical("Please verify exchange positions manually before restarting.")
+        sys.exit(1)
     except KeyboardInterrupt:
         # This catches the physical Ctrl+C in the terminal
-        # We just pass because bot.start() -> finally -> bot.shutdown() handles it.
-        pass
-    except SystemExit:
-        # Graceful exit
-        pass
+        logger.info("Keyboard interrupt received.")
+    except Exception as e:
+        logger.critical(f"Unhandled exception: {e}")
+        import traceback
+        logger.critical(traceback.format_exc())
+        sys.exit(1)

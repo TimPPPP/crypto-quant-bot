@@ -1,8 +1,9 @@
 import os
+import re
 import logging
 import requests
-from typing import Dict, Optional, List
-from datetime import datetime
+from typing import Dict, Optional, List, Set
+from datetime import datetime, timezone
 from dataclasses import dataclass, asdict
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -87,9 +88,9 @@ class TradeExecutor:
             os.getenv('EXEC_PROFIT_CAPTURE', self.DEFAULT_PROFIT_CAPTURE)
         )
 
-        # Position tracking
+        # Position tracking (Set for O(1) lookups)
         self.MAX_POSITIONS_PER_COIN = 1
-        self.active_positions: List[str] = []
+        self.active_positions: Set[str] = set()
 
         # Trade history for analysis
         self.trade_history: List[TradeRecord] = []
@@ -100,6 +101,17 @@ class TradeExecutor:
             f"Min Profit: {self.MIN_NET_PROFIT*100:.1f}%"
         )
 
+    def _sanitize_symbol(self, symbol: str) -> str:
+        """
+        Sanitize symbol input to prevent SQL injection.
+        Only allows alphanumeric characters and common symbol suffixes.
+        """
+        # Only allow alphanumeric, dash, underscore (common in trading symbols)
+        if not re.match(r'^[A-Za-z0-9_-]+$', symbol):
+            raise ValueError(f"Invalid symbol format: {symbol}")
+        # Escape single quotes as additional safety
+        return symbol.replace("'", "''")
+
     def get_24h_funding_avg(self, symbol: str) -> Optional[float]:
         """
         Query QuestDB for 24-hour average funding rate.
@@ -107,10 +119,12 @@ class TradeExecutor:
         Returns:
             Average hourly funding rate, or None if data unavailable
         """
+        # Sanitize input to prevent SQL injection
+        safe_symbol = self._sanitize_symbol(symbol)
         query = f"""
         SELECT avg(funding_rate)
         FROM funding_history
-        WHERE symbol = '{symbol}'
+        WHERE symbol = '{safe_symbol}'
         AND timestamp >= dateadd('d', -1, now());
         """
         try:
@@ -273,7 +287,7 @@ class TradeExecutor:
         record = TradeRecord(
             pair=signal['pair'],
             direction="SHORT_SPREAD" if signal['z_score'] > 0 else "LONG_SPREAD",
-            timestamp=datetime.utcnow().isoformat(),
+            timestamp=datetime.now(timezone.utc).isoformat(),
             entry_z=signal['z_score'],
             expected_profit_pct=expected_profit,
             estimated_duration_hours=signal.get('half_life_hours', 24) * self.duration_multiplier,
@@ -291,13 +305,11 @@ class TradeExecutor:
 
     def add_active_position(self, pair: str):
         """Register an active position."""
-        if pair not in self.active_positions:
-            self.active_positions.append(pair)
+        self.active_positions.add(pair)
 
     def remove_active_position(self, pair: str):
         """Remove a closed position."""
-        if pair in self.active_positions:
-            self.active_positions.remove(pair)
+        self.active_positions.discard(pair)
 
 
 if __name__ == "__main__":
