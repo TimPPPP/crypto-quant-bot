@@ -205,3 +205,17 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# macOS
+.DS_Store
+*.DS_Store
+
+# Lock files (state management)
+*.lock
+data/state/*.lock
+
+# Backups older than 7 days should be cleaned manually
+backups/
+
+# QuestDB data (local only)
+data/db/
