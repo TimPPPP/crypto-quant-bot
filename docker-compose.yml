@@ -16,7 +16,16 @@ services:
       - RISK_EQUITY=${RISK_EQUITY:-10000}
       - RISK_PER_TRADE=${RISK_PER_TRADE:-0.01}
       - RISK_MAX_LEVERAGE=${RISK_MAX_LEVERAGE:-2.0}
+      - PAPER_TRADING=${PAPER_TRADING:-true}
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import sys; sys.exit(0)'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - crypto-bot-network
 
   # 2. The Generic Worker (Use this for Ingestion, Testing, etc.)
   worker:
@@ -31,6 +40,34 @@ services:
       - PYTHONUNBUFFERED=1
       - QUESTDB_HOST=db
       - PYTHONPATH=/app
+    networks:
+      - crypto-bot-network
+
+  # 2.5 Web API & Dashboard
+  api:
+    build: .
+    container_name: crypto_api
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./:/app
+    depends_on:
+      - db
+    environment:
+      - PYTHONUNBUFFERED=1
+      - QUESTDB_HOST=db
+      - PYTHONPATH=/app
+      - API_RELOAD=${API_RELOAD:-true}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - crypto-bot-network
 
   # 3. The Visualization Tool
   grafana:
@@ -42,9 +79,18 @@ services:
       - db
     environment:
       - GF_INSTALL_PLUGINS=questdb-questdb-datasource
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD:-admin}
     volumes:
       - grafana_data:/var/lib/grafana
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - crypto-bot-network
 
   # 4. The Database
   db:
@@ -57,6 +103,14 @@ services:
       - "8812:8812"
     volumes:
       - ./data/db:/root/.questdb/db
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - crypto-bot-network
 
   # 5. The Research Station (Jupyter Lab)
   jupyter:
@@ -70,7 +124,7 @@ services:
     environment:
       - QUESTDB_HOST=db
       - PYTHONPATH=/app
-      - JUPYTER_TOKEN=mysecretpassword
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN:-changeme}
     command: >
       jupyter lab
       --ip=0.0.0.0
@@ -79,6 +133,12 @@ services:
       --allow-root
     depends_on:
       - db
+    networks:
+      - crypto-bot-network
 
 volumes:
   grafana_data:
+
+networks:
+  crypto-bot-network:
+    driver: bridge

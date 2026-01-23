@@ -17,6 +17,7 @@ from src.execution.executor import TradeExecutor
 from src.models.kalman import KalmanFilterRegime
 from src.models.coint_scanner import CointegrationScanner
 from src.features.clustering import get_cluster_map
+from src.adaptive.online_adaptation import AdaptiveController, apply_overrides_to_live
 
 # Setup Logging
 logging.basicConfig(
@@ -42,6 +43,7 @@ SCANNER_LOOP_INTERVAL = int(os.getenv('SCANNER_LOOP_INTERVAL', 86400))
 # Exit thresholds
 EXIT_Z_THRESHOLD_LONG = float(os.getenv('EXIT_Z_THRESHOLD_LONG', -0.5))
 EXIT_Z_THRESHOLD_SHORT = float(os.getenv('EXIT_Z_THRESHOLD_SHORT', 0.5))
+ADAPTIVE_LOOP_INTERVAL = int(os.getenv('ADAPTIVE_LOOP_INTERVAL', 3600))
 
 # Top level function for multiprocessing (Pickle requirement)
 def _run_heavy_scan_job():
@@ -63,6 +65,13 @@ class TradingBot:
             max_leverage=DEFAULT_MAX_LEVERAGE
         )
         self.trade_executor = TradeExecutor()
+        self.exit_z_short = EXIT_Z_THRESHOLD_SHORT
+        self.exit_z_long = EXIT_Z_THRESHOLD_LONG
+        self._adaptive_entry_z = float(KalmanFilterRegime.DEFAULT_ENTRY_Z)
+        self.adaptive = AdaptiveController()
+        saved_overrides = self.adaptive.load_saved_overrides()
+        if saved_overrides:
+            self._apply_adaptive_overrides(saved_overrides)
 
         # 2. Strategy Memory
         self.active_pairs = {}
@@ -101,7 +110,7 @@ class TradingBot:
         logger.info(f"Found {len(saved_data)} saved positions.")
         for pair_id, data in saved_data.items():
             if data.get('is_active'):
-                kf = KalmanFilterRegime()
+                kf = KalmanFilterRegime(entry_z_threshold=self._current_entry_z())
                 success = self.state_manager.hydrate_kalman_model(kf, pair_id)
                 if success:
                     self.active_pairs[pair_id] = kf
@@ -158,7 +167,7 @@ class TradingBot:
             for pair in new_pair_ids:
                 if pair not in current_ids:
                     logger.info(f"NEW PAIR FOUND: {pair}")
-                    kf = KalmanFilterRegime()
+                    kf = KalmanFilterRegime(entry_z_threshold=self._current_entry_z())
                     kf.latest_z = 0.0
                     self.active_pairs[pair] = kf
 
@@ -223,9 +232,9 @@ class TradingBot:
                         # Exit when spread reverts past the zero line
                         # SHORT_SPREAD (entry_z > 0): exit when z drops below threshold
                         # LONG_SPREAD (entry_z < 0): exit when z rises above threshold
-                        if entry_z > 0 and current_z < EXIT_Z_THRESHOLD_SHORT:
+                        if entry_z > 0 and current_z < self.exit_z_short:
                             should_exit = True
-                        if entry_z < 0 and current_z > EXIT_Z_THRESHOLD_LONG:
+                        if entry_z < 0 and current_z > self.exit_z_long:
                             should_exit = True
 
                         if should_exit:
@@ -271,8 +280,35 @@ class TradingBot:
                     pos = self.state_manager.get_position(pair)
                     has_position = pos is not None
 
+                    pnl_return = None
+                    if pos:
+                        trade = pos.get('trade', {})
+                        direction = trade.get('direction')
+                        entry_py = float(trade.get('price_a', 0))
+                        entry_px = float(trade.get('price_b', 0))
+                        size_a = float(trade.get('size_a', 0))
+                        size_b = float(trade.get('size_b', 0))
+                        coin_y, coin_x = pair.split('-')
+                        py = float(all_prices.get(coin_y, 0))
+                        px = float(all_prices.get(coin_x, 0))
+                        if entry_py > 0 and entry_px > 0 and py > 0 and px > 0:
+                            notional = entry_py * size_a + entry_px * size_b
+                            if notional > 0:
+                                if direction == "LONG_SPREAD":
+                                    pnl_y = (py - entry_py) * size_a
+                                    pnl_x = (entry_px - px) * size_b
+                                else:  # SHORT_SPREAD
+                                    pnl_y = (entry_py - py) * size_a
+                                    pnl_x = (px - entry_px) * size_b
+                                pnl_return = (pnl_y + pnl_x) / notional
+
                     # Pass is_open_position to only check stop loss when we have a position
-                    if self.risk_engine.check_stop_loss(pair, current_z, is_open_position=has_position):
+                    if self.risk_engine.check_stop_loss(
+                        pair,
+                        current_z,
+                        is_open_position=has_position,
+                        pnl_return=pnl_return,
+                    ):
                         if pos:
                             coin_y, coin_x = pair.split('-')
                             py = float(all_prices.get(coin_y, 0))
@@ -333,7 +369,8 @@ class TradingBot:
                     'size_a': size_a, 'size_b': size_b,
                     'price_a': price_a, 'price_b': price_b,
                     'entry_z': z_score,
-                    'direction': direction
+                    'direction': direction,
+                    'entry_ts': datetime.now(timezone.utc).isoformat(),
                 }
                 self.state_manager.save_position(pair, trade_record, self.active_pairs[pair])
                 # Register position with risk engine
@@ -371,6 +408,7 @@ class TradingBot:
                 self.risk_engine.unregister_position(pair)
                 # Remove from executor tracking
                 self.trade_executor.remove_active_position(pair)
+                self._record_exit_trade(pair, trade_data, price_a, price_b, reason)
 
                 if pair in self.retiring_pairs:
                     del self.retiring_pairs[pair]
@@ -378,6 +416,72 @@ class TradingBot:
         finally:
             async with self._pending_orders_lock:
                 self._pending_orders.discard(pair)
+
+    def _record_exit_trade(self, pair, trade_data, price_a, price_b, reason) -> None:
+        entry_py = float(trade_data.get('price_a', 0))
+        entry_px = float(trade_data.get('price_b', 0))
+        size_a = float(trade_data.get('size_a', 0))
+        size_b = float(trade_data.get('size_b', 0))
+        direction = trade_data.get('direction')
+        entry_ts = trade_data.get("entry_ts")
+        exit_ts = datetime.now(timezone.utc).isoformat()
+
+        pnl_return = None
+        if entry_py > 0 and entry_px > 0 and price_a > 0 and price_b > 0:
+            notional = entry_py * size_a + entry_px * size_b
+            if notional > 0:
+                if direction == "LONG_SPREAD":
+                    pnl_y = (price_a - entry_py) * size_a
+                    pnl_x = (entry_px - price_b) * size_b
+                else:
+                    pnl_y = (entry_py - price_a) * size_a
+                    pnl_x = (price_b - entry_px) * size_b
+                pnl_return = (pnl_y + pnl_x) / notional
+
+        hold_hours = None
+        if entry_ts:
+            try:
+                entry_dt = datetime.fromisoformat(str(entry_ts))
+                if entry_dt.tzinfo is None:
+                    entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+                exit_dt = datetime.fromisoformat(exit_ts)
+                if exit_dt.tzinfo is None:
+                    exit_dt = exit_dt.replace(tzinfo=timezone.utc)
+                hold_hours = (exit_dt - entry_dt).total_seconds() / 3600.0
+            except Exception:
+                hold_hours = None
+
+        record = {
+            "pair": pair,
+            "entry_ts": entry_ts,
+            "exit_ts": exit_ts,
+            "entry_z": trade_data.get("entry_z"),
+            "exit_reason": reason,
+            "pnl_return": pnl_return,
+            "hold_hours": hold_hours,
+        }
+        self.adaptive.record_trade(record)
+
+    def _current_entry_z(self) -> float:
+        for kf in self.active_pairs.values():
+            return float(getattr(kf, "entry_z_threshold", KalmanFilterRegime.DEFAULT_ENTRY_Z))
+        return float(self._adaptive_entry_z)
+
+    def _current_adaptive_params(self) -> dict:
+        return {
+            "ENTRY_Z": self._current_entry_z(),
+            "EXIT_Z": abs(float(self.exit_z_short)),
+            "MIN_PROFIT_HURDLE": float(self.trade_executor.MIN_NET_PROFIT),
+            "MAX_PORTFOLIO_POSITIONS": int(self.risk_engine.max_positions),
+            "MAX_POSITIONS_PER_COIN": int(self.risk_engine.max_positions_per_coin),
+            "STOP_LOSS_PCT": float(self.risk_engine.stop_loss_pct),
+        }
+
+    def _apply_adaptive_overrides(self, overrides: dict) -> None:
+        if "ENTRY_Z" in overrides:
+            self._adaptive_entry_z = float(overrides["ENTRY_Z"])
+        apply_overrides_to_live(self, overrides)
+        logger.info("Applied adaptive overrides: %s", overrides)
 
     async def start(self):
         logger.info("SYSTEM STARTUP INITIATED")
@@ -389,7 +493,8 @@ class TradingBot:
             await asyncio.gather(
                 self.tick_loop(),
                 self.risk_loop(),
-                self.scanner_loop()
+                self.scanner_loop(),
+                self.adaptive_loop(),
             )
         except asyncio.CancelledError:
             logger.info("Main loop cancelled. Cleaning up...")
@@ -421,6 +526,18 @@ class TradingBot:
             logger.error(f"Error shutting down executor: {e}")
 
         logger.info("Shutdown complete.")
+
+    async def adaptive_loop(self):
+        logger.info("Adaptive Loop Started.")
+        while self.is_running:
+            try:
+                overrides, stats = self.adaptive.maybe_update_live(self._current_adaptive_params())
+                if overrides:
+                    self._apply_adaptive_overrides(overrides)
+                    logger.info("Adaptive update applied. Stats=%s", stats.__dict__ if stats else None)
+            except Exception as e:
+                logger.error(f"Adaptive Loop Error: {e}")
+            await asyncio.sleep(ADAPTIVE_LOOP_INTERVAL)
 
 
 if __name__ == "__main__":

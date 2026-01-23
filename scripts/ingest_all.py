@@ -1,28 +1,31 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
-Parallel data ingestion script.
+Master Ingestion Script for Multi-Source Data Collection.
 
-Runs ingest_1m (candles) and ingest_funding (funding rates) concurrently
-to hydrate the QuestDB database with all necessary market data.
+Orchestrates data ingestion from multiple exchanges:
+1. Hyperliquid (primary - candles + funding)
+2. Binance (secondary - gap filling)
+3. Coinbase (tertiary - additional coverage)
 
-Usage:python3 tests/test_safety.py
-  # From project root:
-  python scripts/ingest_all.py
-
-  # Or in Docker:
-  docker-compose exec worker python scripts/ingest_all.py
+Usage:
+    python scripts/ingest_all.py                    # Run all ingesters
+    python scripts/ingest_all.py --hyperliquid      # Only Hyperliquid
+    python scripts/ingest_all.py --binance          # Only Binance
+    python scripts/ingest_all.py --funding          # Only funding rates
+    python scripts/ingest_all.py --days 180         # Custom lookback
 """
 
+import os
 import sys
+import argparse
 import logging
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-# Add project root to path
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
+# Ensure project root is on sys.path
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-# Setup logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -30,83 +33,174 @@ logging.basicConfig(
 logger = logging.getLogger("IngestAll")
 
 
-def run_ingest_1m():
-    """Run 1-minute candle ingestion."""
-    logger.info("Starting 1m candle ingestion...")
-    from src.collectors.ingest_1m import run_ingest
-    try:
-        run_ingest()
-        logger.info("✅ 1m candle ingestion completed successfully.")
-        return True
-    except Exception as e:
-        logger.error(f"❌ 1m candle ingestion failed: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return False
+def run_hyperliquid_candles(days: int, top_n: int, resume: bool):
+    """Run Hyperliquid candle ingestion."""
+    logger.info("=" * 60)
+    logger.info("HYPERLIQUID CANDLE INGESTION")
+    logger.info("=" * 60)
+
+    os.environ['INGEST_LOOKBACK_DAYS'] = str(days)
+    os.environ['INGEST_TOP_N'] = str(top_n)
+
+    from src.collectors.ingest_hyperliquid import HyperliquidCandleIngester
+    ingester = HyperliquidCandleIngester()
+    ingester.run(resume=resume)
 
 
-def run_ingest_funding():
-    """Run funding history ingestion."""
-    logger.info("Starting funding history ingestion...")
-    from src.collectors.ingest_funding import run_funding_ingest
-    try:
-        run_funding_ingest(resume=True)
-        logger.info("✅ Funding history ingestion completed successfully.")
-        return True
-    except Exception as e:
-        logger.error(f"❌ Funding history ingestion failed: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return False
+def run_okx_candles(days: int, top_n: int, resume: bool):
+    """Run OKX candle ingestion."""
+    logger.info("=" * 60)
+    logger.info("OKX CANDLE INGESTION")
+    logger.info("=" * 60)
+
+    os.environ['INGEST_LOOKBACK_DAYS'] = str(days)
+    os.environ['INGEST_TOP_N'] = str(top_n)
+
+    from src.collectors.ingest_okx import OKXCandleIngester
+    ingester = OKXCandleIngester()
+    ingester.run(resume=resume)
+
+
+def run_binance_candles(days: int, top_n: int, resume: bool):
+    """Run Binance candle ingestion (if not geo-restricted)."""
+    logger.info("=" * 60)
+    logger.info("BINANCE CANDLE INGESTION")
+    logger.info("=" * 60)
+
+    os.environ['INGEST_LOOKBACK_DAYS'] = str(days)
+    os.environ['INGEST_TOP_N'] = str(top_n)
+
+    from src.collectors.ingest_binance import BinanceCandleIngester
+    ingester = BinanceCandleIngester()
+    ingester.run(resume=resume)
+
+
+def run_coinbase_candles(days: int, top_n: int, resume: bool):
+    """Run Coinbase candle ingestion."""
+    logger.info("=" * 60)
+    logger.info("COINBASE CANDLE INGESTION")
+    logger.info("=" * 60)
+
+    os.environ['INGEST_LOOKBACK_DAYS'] = str(days)
+    os.environ['INGEST_TOP_N'] = str(top_n)
+
+    from src.collectors.ingest_coinbase import CoinbaseIngester
+    ingester = CoinbaseIngester()
+    ingester.run(resume=resume)
+
+
+def run_funding(days: int, top_n: int, resume: bool):
+    """Run Hyperliquid funding rate ingestion."""
+    logger.info("=" * 60)
+    logger.info("FUNDING RATE INGESTION")
+    logger.info("=" * 60)
+
+    os.environ['INGEST_LOOKBACK_DAYS'] = str(days)
+    os.environ['INGEST_TOP_N'] = str(top_n)
+
+    from src.collectors.ingest_funding import FundingIngester
+    ingester = FundingIngester()
+    ingester.run(resume=resume)
+
+
+def run_export(merged: bool, days: int, min_coverage: float):
+    """Export data to parquet files."""
+    logger.info("=" * 60)
+    logger.info("DATA EXPORT")
+    logger.info("=" * 60)
+
+    os.environ['BACKTEST_LOOKBACK_DAYS'] = str(days)
+
+    from research.pipeline.step0_export_data import main as export_main
+    export_main(use_merged=merged, min_coverage=min_coverage)
 
 
 def main():
-    """Run both ingestions in parallel."""
-    logger.info("=" * 80)
-    logger.info("STARTING PARALLEL DATA INGESTION")
-    logger.info("=" * 80)
-    logger.info("This will fetch and ingest:")
-    logger.info("  1. 1-minute candle data (OHLCV)")
-    logger.info("  2. Funding rate history")
-    logger.info("=" * 80)
+    parser = argparse.ArgumentParser(
+        description="Multi-source data ingestion orchestrator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    python scripts/ingest_all.py                     # All sources, 365 days
+    python scripts/ingest_all.py --days 180          # 6 months
+    python scripts/ingest_all.py --hyperliquid       # Only Hyperliquid candles
+    python scripts/ingest_all.py --binance           # Only Binance candles
+    python scripts/ingest_all.py --export --merged   # Export with merging
+    python scripts/ingest_all.py --no-resume         # Fresh start (clear progress)
+"""
+    )
 
-    results = {}
-    
-    # Run both ingestions in parallel using ProcessPoolExecutor
-    with ProcessPoolExecutor(max_workers=2) as executor:
-        # Submit both tasks
-        future_1m = executor.submit(run_ingest_1m)
-        future_funding = executor.submit(run_ingest_funding)
+    # What to run
+    parser.add_argument("--hyperliquid", "-hl", action="store_true",
+                        help="Run Hyperliquid candle ingestion")
+    parser.add_argument("--okx", "-ox", action="store_true",
+                        help="Run OKX candle ingestion (recommended)")
+    parser.add_argument("--binance", "-bn", action="store_true",
+                        help="Run Binance candle ingestion (may be geo-restricted)")
+    parser.add_argument("--coinbase", "-cb", action="store_true",
+                        help="Run Coinbase candle ingestion")
+    parser.add_argument("--funding", "-f", action="store_true",
+                        help="Run funding rate ingestion")
+    parser.add_argument("--export", "-e", action="store_true",
+                        help="Export data to parquet after ingestion")
 
-        # Collect results as they complete
-        for future in as_completed([future_1m, future_funding]):
-            try:
-                result = future.result()
-                if future == future_1m:
-                    results['1m'] = result
-                else:
-                    results['funding'] = result
-            except Exception as e:
-                logger.error(f"Task failed with exception: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
+    # Options
+    parser.add_argument("--days", "-d", type=int, default=365,
+                        help="Lookback days (default: 365)")
+    parser.add_argument("--top-n", "-n", type=int, default=100,
+                        help="Top N coins to ingest (default: 100)")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="Start fresh, don't resume from progress")
+    parser.add_argument("--merged", "-m", action="store_true",
+                        help="Use merged export (multi-source)")
+    parser.add_argument("--min-coverage", type=float, default=0.85,
+                        help="Minimum data coverage (default: 0.85)")
 
-    # Summary
-    logger.info("=" * 80)
-    logger.info("INGESTION SUMMARY")
-    logger.info("=" * 80)
-    logger.info(f"1m Candles:       {'✅ SUCCESS' if results.get('1m') else '❌ FAILED'}")
-    logger.info(f"Funding History:  {'✅ SUCCESS' if results.get('funding') else '❌ FAILED'}")
-    logger.info("=" * 80)
+    args = parser.parse_args()
 
-    # Exit with appropriate code
-    if all(results.values()):
-        logger.info("All ingestions completed successfully!")
-        return 0
-    else:
-        logger.warning("One or more ingestions failed. See logs above.")
-        return 1
+    # If no specific source selected, run recommended sources
+    # NOTE: Hyperliquid API only returns ~3.5 days of data, not historical!
+    # Use OKX + Coinbase for historical data, Hyperliquid only for native tokens
+    run_all = not any([args.hyperliquid, args.okx, args.binance, args.coinbase, args.funding, args.export])
+
+    resume = not args.no_resume
+
+    try:
+        # OKX first - best historical data source (works in most regions)
+        if run_all or args.okx:
+            run_okx_candles(args.days, args.top_n, resume)
+
+        # Coinbase second - good coverage for major coins
+        if run_all or args.coinbase:
+            run_coinbase_candles(args.days, args.top_n, resume)
+
+        # Hyperliquid ONLY if explicitly requested (only provides ~3.5 days of data!)
+        # Useful only for Hyperliquid-native tokens (HYPE, PURR) not on other exchanges
+        if args.hyperliquid:
+            logger.warning("NOTE: Hyperliquid API only provides ~3.5 days of recent data!")
+            run_hyperliquid_candles(args.days, args.top_n, resume)
+
+        # Binance only if explicitly requested (often geo-restricted)
+        if args.binance:
+            run_binance_candles(args.days, args.top_n, resume)
+
+        if run_all or args.funding:
+            run_funding(args.days, args.top_n, resume)
+
+        if run_all or args.export:
+            run_export(args.merged or run_all, args.days, args.min_coverage)
+
+        logger.info("=" * 60)
+        logger.info("ALL INGESTION COMPLETE!")
+        logger.info("=" * 60)
+
+    except KeyboardInterrupt:
+        logger.warning("Ingestion interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Ingestion failed: {e}")
+        raise
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

@@ -23,11 +23,12 @@ class RiskEngine:
     DEFAULT_EQUITY = 10000.0
     DEFAULT_RISK_PER_TRADE = 0.01  # 1%
     DEFAULT_MAX_LEVERAGE = 2.0
-    DEFAULT_MAX_Z_SCORE = 4.5      # Stop loss threshold
-    DEFAULT_MAX_ENTRY_Z = 4.0      # Don't enter if too stretched
+    DEFAULT_MAX_Z_SCORE = 4.0      # Stop loss threshold
+    DEFAULT_MAX_ENTRY_Z = 3.5      # Don't enter if too stretched
     DEFAULT_DRAWDOWN_LIMIT = 0.05  # 5% kill switch
-    DEFAULT_MAX_POSITIONS = 10     # Max concurrent positions
-    DEFAULT_MAX_PER_COIN = 1       # Max positions per coin
+    DEFAULT_MAX_POSITIONS = 8      # Max concurrent positions
+    DEFAULT_MAX_PER_COIN = 2       # Max positions per coin
+    DEFAULT_STOP_LOSS_PCT = 0.03   # Hard PnL stop per position
 
     def __init__(
         self,
@@ -80,6 +81,9 @@ class RiskEngine:
         self.max_positions_per_coin = int(
             max_positions_per_coin or
             os.getenv('RISK_MAX_PER_COIN', self.DEFAULT_MAX_PER_COIN)
+        )
+        self.stop_loss_pct = float(
+            os.getenv('RISK_STOP_LOSS_PCT', self.DEFAULT_STOP_LOSS_PCT)
         )
 
         # Current state
@@ -238,7 +242,8 @@ class RiskEngine:
         self,
         pair: str,
         z_score: float,
-        is_open_position: bool = False
+        is_open_position: bool = False,
+        pnl_return: Optional[float] = None
     ) -> bool:
         """
         Check if stop loss should be triggered.
@@ -254,6 +259,12 @@ class RiskEngine:
         # Only check if we have a position
         if not is_open_position:
             return False
+
+        if pnl_return is not None and pnl_return <= -self.stop_loss_pct:
+            logger.warning(
+                f"STOP LOSS: {pair} PnL={pnl_return:.2%} exceeds {self.stop_loss_pct:.2%}"
+            )
+            return True
 
         if abs(z_score) > self.MAX_Z_SCORE:
             logger.warning(

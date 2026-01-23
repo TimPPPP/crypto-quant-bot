@@ -14,7 +14,7 @@ import logging
 import traceback
 from abc import ABC, abstractmethod
 from typing import Dict, Optional, List
-from datetime import datetime, timezone
+from datetime import datetime, date, time as dt_time, timezone
 
 import requests
 from questdb.ingress import Sender, TimestampNanos
@@ -25,6 +25,29 @@ QUESTDB_PORT = 9009
 QUESTDB_HTTP = f"http://{QUESTDB_HOST}:9000/exec"
 
 logger = logging.getLogger("BaseIngester")
+
+def _parse_iso_datetime(value: str, end_of_day: bool = False) -> datetime:
+    """
+    Parse an ISO date/datetime string into UTC.
+
+    If a date-only string is provided and end_of_day is True, use 23:59:59.999.
+    """
+    raw = value.strip()
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        d = date.fromisoformat(raw)
+        if end_of_day:
+            dt = datetime.combine(d, dt_time(23, 59, 59, 999000))
+        else:
+            dt = datetime.combine(d, dt_time(0, 0, 0))
+    else:
+        if end_of_day and len(raw) <= 10:
+            dt = dt.replace(hour=23, minute=59, second=59, microsecond=999000)
+
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 class BaseIngester(ABC):
@@ -63,9 +86,40 @@ class BaseIngester(ABC):
         self.progress_file = progress_file
         self.top_n_coins = top_n_coins
         self.lookback_days = lookback_days
+        self.start_time_ms, self.end_time_ms = self._resolve_time_range()
 
         # Setup logger for this instance
         self.logger = logging.getLogger(f"Ingester.{table_name}")
+
+    def _resolve_time_range(self) -> tuple[Optional[int], Optional[int]]:
+        """Resolve an explicit ingest time range from env vars, if provided."""
+        start_ts = os.getenv("INGEST_START_TS")
+        end_ts = os.getenv("INGEST_END_TS")
+        start_date = os.getenv("INGEST_START_DATE")
+        end_date = os.getenv("INGEST_END_DATE")
+
+        if start_ts or end_ts:
+            if not (start_ts and end_ts):
+                raise ValueError("Both INGEST_START_TS and INGEST_END_TS must be set.")
+            return int(start_ts), int(end_ts)
+
+        if start_date or end_date:
+            if not (start_date and end_date):
+                raise ValueError("Both INGEST_START_DATE and INGEST_END_DATE must be set.")
+            start_dt = _parse_iso_datetime(start_date, end_of_day=False)
+            end_dt = _parse_iso_datetime(end_date, end_of_day=True)
+            return int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000)
+
+        return None, None
+
+    def _get_time_range(self) -> tuple[int, int]:
+        """Return the effective start/end timestamps for ingestion in ms."""
+        if self.start_time_ms is not None and self.end_time_ms is not None:
+            return self.start_time_ms, self.end_time_ms
+
+        end_time_ms = int(time.time() * 1000)
+        start_time_ms = end_time_ms - (self.lookback_days * 24 * 60 * 60 * 1000)
+        return start_time_ms, end_time_ms
 
     def load_progress(self) -> Dict:
         """Load progress from file to resume interrupted ingestion."""
@@ -147,7 +201,18 @@ class BaseIngester(ABC):
         """
         self.ensure_table_schema()
 
-        self.logger.info(f"Starting ingestion: {self.table_name}, Last {self.lookback_days} days.")
+        start_time_ms, end_time_ms = self._get_time_range()
+        if self.start_time_ms is not None and self.end_time_ms is not None:
+            start_ts = datetime.fromtimestamp(start_time_ms / 1000, tz=timezone.utc)
+            end_ts = datetime.fromtimestamp(end_time_ms / 1000, tz=timezone.utc)
+            self.logger.info(
+                "Starting ingestion: %s, range %s -> %s (UTC).",
+                self.table_name,
+                start_ts.isoformat(),
+                end_ts.isoformat(),
+            )
+        else:
+            self.logger.info(f"Starting ingestion: {self.table_name}, Last {self.lookback_days} days.")
 
         coins = self.get_coins()
         progress = self.load_progress() if resume else {}
@@ -181,8 +246,7 @@ class BaseIngester(ABC):
             coins: List of coins to process
             progress: Progress tracking dictionary
         """
-        end_time_ms = int(time.time() * 1000)
-        start_time_ms = end_time_ms - (self.lookback_days * 24 * 60 * 60 * 1000)
+        start_time_ms, end_time_ms = self._get_time_range()
 
         for coin in coins:
             # Check if already completed

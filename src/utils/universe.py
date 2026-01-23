@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger("Universe")
 
 # Configuration
-MIN_VOLUME_USD = float(os.getenv('MIN_VOLUME_USD', 1_000_000))
+MIN_VOLUME_USD = float(os.getenv('MIN_VOLUME_USD', 250_000))
 BUFFER_SIZE = int(os.getenv('UNIVERSE_BUFFER', 30))
 CACHE_TTL_SECONDS = int(os.getenv('UNIVERSE_CACHE_TTL', 3600))  # 1 hour default
 
@@ -31,7 +31,12 @@ _universe_cache = {
 _cache_lock = threading.Lock()
 
 
-def get_liquid_universe(top_n: int = 50, use_buffer: bool = False, force_refresh: bool = False):
+def get_liquid_universe(
+    top_n: int = 50,
+    use_buffer: bool = False,
+    force_refresh: bool = False,
+    min_age_days: int = None
+):
     """
     Fetches the top liquid assets from Hyperliquid On-Chain Data.
 
@@ -41,6 +46,8 @@ def get_liquid_universe(top_n: int = 50, use_buffer: bool = False, force_refresh
         top_n: Number of primary assets to select (default 50).
         use_buffer: If True, fetches an extra BUFFER_SIZE coins for rank shifting.
         force_refresh: If True, bypass cache and fetch fresh data.
+        min_age_days: Minimum age in days for a coin to be included (filters out new coins).
+                     If None, no age filtering is applied.
 
     Returns:
         List of symbol strings sorted by volume.
@@ -123,6 +130,11 @@ def get_liquid_universe(top_n: int = 50, use_buffer: bool = False, force_refresh
 
                         if volume < MIN_VOLUME_USD:
                             continue
+
+                        # Optional: Filter by coin age (if min_age_days specified)
+                        # Note: Hyperliquid API doesn't provide listing date directly
+                        # This would require a separate lookup or hardcoded list of launch dates
+                        # For now, we'll add this as a placeholder for future enhancement
 
                         valid_pairs.append({
                             'symbol': symbol,

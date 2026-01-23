@@ -190,8 +190,13 @@ class DataLoader:
         # Forward fill prices first (carry last known price)
         master_df = master_df.ffill()
 
-        # Backward fill for coins listed partway through
-        master_df = master_df.bfill()
+        # Avoid backward fill to prevent look-ahead bias for newly listed coins.
+        # Drop rows where any close price is still missing.
+        try:
+            close_cols = master_df.loc[:, idx[:, 'close']].columns
+            master_df = master_df.dropna(subset=close_cols, how='any')
+        except KeyError:
+            pass
 
         # Drop fully empty rows
         master_df = master_df.dropna(how='all')

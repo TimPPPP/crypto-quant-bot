@@ -2,9 +2,112 @@ import numpy as np
 import pandas as pd
 import logging
 from collections import deque
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.adaptive.market_regime import MarketRegime, VolatilityRegime, TrendRegime
 
 logger = logging.getLogger("KalmanFilter")
+
+
+# =============================================================================
+# ADAPTIVE KALMAN PARAMETER FUNCTIONS
+# =============================================================================
+
+def compute_adaptive_kalman_params(
+    regime: "MarketRegime",
+    base_delta: float = 1e-6,
+    base_R: float = 1e-2,
+    delta_mult_min: float = 0.3,
+    delta_mult_max: float = 3.0,
+    r_mult_min: float = 0.5,
+    r_mult_max: float = 3.0,
+) -> Tuple[float, float]:
+    """
+    Compute adaptive Kalman filter parameters based on market regime.
+
+    Adaptation logic:
+    - High volatility → Increase R (trust observations less, more measurement noise)
+    - Trending market → Increase delta (allow beta to adapt faster to changing relationships)
+    - Mean-reverting market → Decrease delta (trust historical beta, less process noise)
+
+    Args:
+        regime: MarketRegime from market_regime.py
+        base_delta: Baseline process noise (Q scaling factor)
+        base_R: Baseline measurement noise
+        delta_mult_min: Minimum delta multiplier
+        delta_mult_max: Maximum delta multiplier
+        r_mult_min: Minimum R multiplier
+        r_mult_max: Maximum R multiplier
+
+    Returns:
+        (adapted_delta, adapted_R)
+    """
+    # Import here to avoid circular imports
+    from src.adaptive.market_regime import VolatilityRegime, TrendRegime
+
+    # --- R Adaptation (Measurement Noise) ---
+    # High vol: increase R to trust observations less (more noise in prices)
+    # Low vol: decrease R to trust observations more
+    if regime.volatility == VolatilityRegime.HIGH:
+        # Scale up based on how extreme the percentile is
+        r_mult = 2.0 + (regime.btc_vol_percentile - 0.75) * 4.0  # 2.0 to 3.0
+    elif regime.volatility == VolatilityRegime.LOW:
+        r_mult = 0.7  # Trust observations more in calm markets
+    else:
+        r_mult = 1.0  # Normal
+
+    r_mult = np.clip(r_mult, r_mult_min, r_mult_max)
+    adapted_R = base_R * r_mult
+
+    # --- Delta Adaptation (Process Noise) ---
+    # Trending: increase delta to let beta adapt faster to changing relationships
+    # Mean-reverting: decrease delta to maintain stable beta estimates
+    if regime.trend == TrendRegime.TRENDING:
+        # Scale up based on autocorrelation strength
+        delta_mult = 2.0 + abs(regime.market_autocorr) * 5.0  # 2.0 to ~2.75
+    elif regime.trend == TrendRegime.MEAN_REVERTING:
+        delta_mult = 0.5  # Very stable beta
+    else:
+        delta_mult = 1.0  # Normal
+
+    delta_mult = np.clip(delta_mult, delta_mult_min, delta_mult_max)
+    adapted_delta = base_delta * delta_mult
+
+    logger.debug(
+        f"Adaptive Kalman: R={adapted_R:.2e} (mult={r_mult:.2f}), "
+        f"delta={adapted_delta:.2e} (mult={delta_mult:.2f})"
+    )
+
+    return adapted_delta, adapted_R
+
+
+def get_adaptive_params_from_config(
+    regime: "MarketRegime",
+    config: Optional[Dict] = None,
+) -> Tuple[float, float]:
+    """
+    Get adaptive Kalman parameters using config values.
+
+    Args:
+        regime: MarketRegime object
+        config: Optional config dict (uses defaults if None)
+
+    Returns:
+        (adapted_delta, adapted_R)
+    """
+    if config is None:
+        config = {}
+
+    return compute_adaptive_kalman_params(
+        regime=regime,
+        base_delta=config.get("KALMAN_BASE_DELTA", 1e-6),
+        base_R=config.get("KALMAN_BASE_R", 1e-2),
+        delta_mult_min=config.get("KALMAN_DELTA_MULT_MIN", 0.3),
+        delta_mult_max=config.get("KALMAN_DELTA_MULT_MAX", 3.0),
+        r_mult_min=config.get("KALMAN_R_MULT_MIN", 0.5),
+        r_mult_max=config.get("KALMAN_R_MULT_MAX", 3.0),
+    )
 
 
 class KalmanFilterRegime:
@@ -16,14 +119,23 @@ class KalmanFilterRegime:
     2. Rolling Z-Score: Uses Realized Volatility for robust signals
     3. Burn-In: Ignores first N ticks to let filter stabilize
     4. Numerical Stability: Bounds on Kalman gain and covariance
+    5. Half-Life Scaled Vol Window: Consistent z-score distribution across pairs
     """
 
     # Default parameters (can be overridden via constructor)
     DEFAULT_DELTA = 1e-6      # Process noise
     DEFAULT_R = 1e-2          # Measurement noise
-    DEFAULT_WINDOW = 30       # Rolling window for volatility
+    DEFAULT_WINDOW = 30       # Rolling window for volatility (legacy default)
     DEFAULT_ENTRY_Z = 2.0     # Z-score threshold for entry signal
     DEFAULT_MIN_SPREAD = 0.003  # Minimum spread error for signal (0.3%)
+
+    # Vol window scaling defaults (aligned with config_backtest)
+    DEFAULT_VOL_WINDOW_HL_MULT = 1.0  # vol_window = half_life * multiplier
+    DEFAULT_MIN_VOL_WINDOW = 60       # 1 hour at 1-min bars
+    DEFAULT_MAX_VOL_WINDOW = 1440     # 24 hours at 1-min bars
+    DEFAULT_VOL_METHOD = "ewma"
+    DEFAULT_VOL_EWMA_ALPHA = 0.2
+    DEFAULT_VOL_MAD_SCALE = 1.4826
 
     def __init__(
         self,
@@ -31,7 +143,12 @@ class KalmanFilterRegime:
         R: float = None,
         rolling_window: int = None,
         entry_z_threshold: float = None,
-        min_spread_pct: float = None
+        min_spread_pct: float = None,
+        half_life_bars: float = None,
+        vol_window_hl_mult: float = None,
+        vol_method: str = None,
+        vol_ewma_alpha: float = None,
+        vol_mad_scale: float = None,
     ):
         """
         Initialize Kalman Filter for swing trading.
@@ -39,17 +156,40 @@ class KalmanFilterRegime:
         Args:
             delta: Process noise (lower = stiffer filter, holds trades longer)
             R: Measurement noise (higher = more tolerant of price blips)
-            rolling_window: Window size for realized volatility calculation
+            rolling_window: Window size for realized volatility calculation.
+                           If half_life_bars is provided and rolling_window is not,
+                           the window will be scaled from half_life.
             entry_z_threshold: Z-score threshold for generating entry signals
             min_spread_pct: Minimum spread error percentage for signals
+            half_life_bars: (NEW) Half-life in bars for this pair. Used to scale
+                           the volatility window for consistent z-score behavior.
+            vol_window_hl_mult: Multiplier for half_life -> vol_window scaling.
+                               Default 1.0 means vol_window = half_life.
         """
         # Use defaults if not specified
         delta = delta if delta is not None else self.DEFAULT_DELTA
         R = R if R is not None else self.DEFAULT_R
-        rolling_window = rolling_window if rolling_window is not None else self.DEFAULT_WINDOW
+
+        # Half-life scaled volatility window (Problem #2 fix)
+        # If half_life_bars provided and rolling_window not explicitly set,
+        # compute rolling_window from half_life for consistent z-score scaling
+        if half_life_bars is not None and rolling_window is None:
+            hl_mult = vol_window_hl_mult if vol_window_hl_mult is not None else self.DEFAULT_VOL_WINDOW_HL_MULT
+            computed_window = int(half_life_bars * hl_mult)
+            # Clamp to reasonable bounds
+            rolling_window = max(self.DEFAULT_MIN_VOL_WINDOW,
+                               min(computed_window, self.DEFAULT_MAX_VOL_WINDOW))
+        else:
+            rolling_window = rolling_window if rolling_window is not None else self.DEFAULT_WINDOW
+
+        # Store half_life for reference
+        self.half_life_bars = half_life_bars
 
         self.entry_z_threshold = entry_z_threshold if entry_z_threshold is not None else self.DEFAULT_ENTRY_Z
         self.min_spread_pct = min_spread_pct if min_spread_pct is not None else self.DEFAULT_MIN_SPREAD
+        self.vol_method = (vol_method or self.DEFAULT_VOL_METHOD).lower()
+        self.vol_ewma_alpha = vol_ewma_alpha if vol_ewma_alpha is not None else self.DEFAULT_VOL_EWMA_ALPHA
+        self.vol_mad_scale = vol_mad_scale if vol_mad_scale is not None else self.DEFAULT_VOL_MAD_SCALE
 
         # State dimensions
         self.n_dim = 2
@@ -143,7 +283,7 @@ class KalmanFilterRegime:
 
         # Calculate realized volatility (std dev of recent errors)
         if self.is_warmed_up:
-            realized_std = np.std(self.error_history)
+            realized_std = self._compute_realized_std()
         else:
             # During warmup, use a conservative estimate
             realized_std = 0.01  # 1% default to avoid division issues
@@ -193,6 +333,22 @@ class KalmanFilterRegime:
             'is_warmed_up': self.is_warmed_up
         }
 
+    def _compute_realized_std(self) -> float:
+        arr = np.asarray(self.error_history, dtype="float64")
+        if len(arr) == 0:
+            return 0.0
+        if self.vol_method == "ewma":
+            alpha = float(self.vol_ewma_alpha)
+            var = 0.0
+            for v in arr:
+                var = alpha * (v * v) + (1.0 - alpha) * var
+            return float(np.sqrt(var))
+        if self.vol_method == "mad":
+            med = float(np.median(arr))
+            mad = float(np.median(np.abs(arr - med)))
+            return float(mad * self.vol_mad_scale)
+        return float(np.std(arr))
+
     def get_state_dict(self) -> Dict:
         """Export filter state for persistence."""
         return {
@@ -203,7 +359,11 @@ class KalmanFilterRegime:
             'error_history': list(self.error_history),
             'rolling_window': self.rolling_window,
             'entry_z_threshold': self.entry_z_threshold,
-            'min_spread_pct': self.min_spread_pct
+            'min_spread_pct': self.min_spread_pct,
+            'half_life_bars': self.half_life_bars,
+            'vol_method': self.vol_method,
+            'vol_ewma_alpha': self.vol_ewma_alpha,
+            'vol_mad_scale': self.vol_mad_scale,
         }
 
     def load_state_dict(self, state: Dict) -> bool:
@@ -237,6 +397,12 @@ class KalmanFilterRegime:
             # Restore thresholds
             self.entry_z_threshold = state.get('entry_z_threshold', self.DEFAULT_ENTRY_Z)
             self.min_spread_pct = state.get('min_spread_pct', self.DEFAULT_MIN_SPREAD)
+            self.vol_method = state.get('vol_method', self.DEFAULT_VOL_METHOD)
+            self.vol_ewma_alpha = state.get('vol_ewma_alpha', self.DEFAULT_VOL_EWMA_ALPHA)
+            self.vol_mad_scale = state.get('vol_mad_scale', self.DEFAULT_VOL_MAD_SCALE)
+
+            # Restore half-life (may be None for legacy states)
+            self.half_life_bars = state.get('half_life_bars', None)
 
             # Update warmup status
             self.is_warmed_up = len(self.error_history) >= self.burn_in

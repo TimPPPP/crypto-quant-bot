@@ -61,7 +61,8 @@ class FundingIngester(BaseIngester):
             symbol SYMBOL,
             funding_rate DOUBLE,
             premium DOUBLE,
-            open_interest DOUBLE
+            open_interest DOUBLE,
+            data_source SYMBOL
         ) TIMESTAMP(timestamp) PARTITION BY MONTH WAL
         DEDUP UPSERT KEYS(timestamp, symbol);
         """
@@ -100,7 +101,8 @@ class FundingIngester(BaseIngester):
             columns={
                 'funding_rate': funding_val,
                 'premium': premium_val,
-                'open_interest': 0.0  # Not available in this API
+                'open_interest': 0.0,  # Not available in this API
+                'data_source': 'hyperliquid',
             },
             at=TimestampNanos.from_datetime(ts_utc)
         )
@@ -116,10 +118,12 @@ class FundingIngester(BaseIngester):
         Override to handle funding-specific logic.
 
         Funding API returns all data from start_time, so we check for
-        reaching near-current time differently.
+        reaching the end time differently.
         """
-        end_time_ms = int(time.time() * 1000)
-        start_time_ms = end_time_ms - (self.lookback_days * 24 * 60 * 60 * 1000)
+        start_time_ms, end_time_ms = self._get_time_range()
+        stop_threshold_ms = end_time_ms
+        if self.start_time_ms is None or self.end_time_ms is None:
+            stop_threshold_ms = (time.time() * 1000) - (2 * 3600 * 1000)
 
         for coin in coins:
             # Check if already completed
@@ -154,6 +158,12 @@ class FundingIngester(BaseIngester):
                     time.sleep(1)
                     continue
 
+                # Filter to requested end range (Hyperliquid API may return beyond end_time)
+                data = [record for record in data if record.get('time', 0) <= end_time_ms]
+                if not data:
+                    # No more data within range; we're done for this coin.
+                    break
+
                 consecutive_errors = 0
 
                 for record in data:
@@ -172,8 +182,8 @@ class FundingIngester(BaseIngester):
                 }
                 self.save_progress(progress)
 
-                # Stop if close to NOW (within 2 hours)
-                if last_time > (time.time() * 1000) - (2 * 3600 * 1000):
+                # Stop if we reached the end time (or near-now for lookback mode).
+                if last_time >= stop_threshold_ms:
                     break
 
                 current_pointer = last_time + 1
@@ -181,7 +191,7 @@ class FundingIngester(BaseIngester):
 
             # Mark as completed
             progress[coin] = {
-                'last_timestamp': int(time.time() * 1000),
+                'last_timestamp': end_time_ms,
                 'total_records': total_records,
                 'completed': True
             }
