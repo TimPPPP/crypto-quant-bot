@@ -401,7 +401,7 @@ BLACKLIST_MAX_STOP_RATE: float = 0.45        # 45% stop-loss rate triggers black
 # REGIME FILTER (Phase 2 - Fix the Edge)
 # =============================================================================
 # Block entries during adverse market regimes (high BTC vol, high dispersion)
-ENABLE_REGIME_FILTER: bool = False  # Disabled for max capital deployment
+ENABLE_REGIME_FILTER: bool = False  # Disabled - slope filter does the work
 REGIME_BTC_VOL_MAX_PERCENTILE: float = 0.85   # Block when BTC vol in top 15% (relaxed from 0.70)
 REGIME_BTC_VOL_LOOKBACK_DAYS: int = 30
 REGIME_DISPERSION_MAX_PERCENTILE: float = 0.90  # Block when dispersion in top 10% (relaxed from 0.80)
