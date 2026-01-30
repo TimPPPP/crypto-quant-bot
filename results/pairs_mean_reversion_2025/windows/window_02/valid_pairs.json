@@ -1,0 +1,29 @@
+{
+  "pairs": [
+    "BLUR-PYTH",
+    "DOT-NEAR",
+    "MORPHO-LTC",
+    "ICP-EIGEN",
+    "APT-ACE",
+    "XLM-AR",
+    "ICP-MORPHO",
+    "APT-NEAR",
+    "UNI-LDO",
+    "XRP-LDO",
+    "ARB-LDO",
+    "FIL-DOT",
+    "XLM-INJ",
+    "APT-EIGEN",
+    "XRP-AAVE",
+    "XRP-ARB",
+    "INJ-ARB",
+    "ORDI-MORPHO",
+    "OP-ORDI",
+    "XLM-MOODENG",
+    "ADA-HBAR",
+    "ADA-ORDI",
+    "ADA-WIF",
+    "EIGEN-OP",
+    "PYTH-LTC"
+  ]
+}

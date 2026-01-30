@@ -1,0 +1,57 @@
+{
+  "freq": "1min",
+  "btc_symbol": "BTC",
+  "scenario_specs": [
+    {
+      "name": "optimistic",
+      "funding_drag_daily": 0.0,
+      "extra_slippage_per_exit": 0.0,
+      "notes": "No funding drag"
+    },
+    {
+      "name": "base_case",
+      "funding_drag_daily": 0.0001,
+      "extra_slippage_per_exit": 0.0,
+      "notes": "0.01% daily funding drag"
+    },
+    {
+      "name": "stress",
+      "funding_drag_daily": 0.0003,
+      "extra_slippage_per_exit": 0.0005,
+      "notes": "0.03% daily funding drag + extra slippage per exit"
+    }
+  ],
+  "metrics": {
+    "optimistic": {
+      "name": "optimistic",
+      "total_return": -0.9161058909840438,
+      "sharpe": -196.9872344233801,
+      "calmar": -1.08943093776757,
+      "max_drawdown": 0.9179104111447126,
+      "max_dd_duration_minutes": 923.0,
+      "corr_to_btc_returns": 0.09852790012671078,
+      "corr_to_btc_equity": 0.8931325018862158
+    },
+    "base_case": {
+      "name": "base_case",
+      "total_return": -0.9161120343832269,
+      "sharpe": -196.99314801486574,
+      "calmar": -1.0894246285193456,
+      "max_drawdown": 0.9179157270926727,
+      "max_dd_duration_minutes": 930.0,
+      "corr_to_btc_returns": 0.09852790021618053,
+      "corr_to_btc_equity": 0.8931310159511714
+    },
+    "stress": {
+      "name": "stress",
+      "total_return": -0.9505014981355517,
+      "sharpe": -239.58283390744955,
+      "calmar": -1.0520761955257742,
+      "max_drawdown": 0.9505014981355517,
+      "max_dd_duration_minutes": 1052.0,
+      "corr_to_btc_returns": 0.09852838310119008,
+      "corr_to_btc_equity": 0.8757631938600822
+    }
+  },
+  "portfolio_return_definition": "sum(returns_matrix[pairs]) per bar; nonzero returns occur at trade exits"
+}

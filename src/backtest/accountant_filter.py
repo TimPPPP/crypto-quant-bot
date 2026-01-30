@@ -313,6 +313,7 @@ def compute_ou_expected_profit(
     use_config_costs: bool = True,  # Use actual config fees/slippage
     funding_cost_per_bar: Optional[Union[float, pd.DataFrame]] = None,
     bars_per_day: float = 1440.0,
+    calibration_discount: Optional[float] = None,  # None = use config OU_CALIBRATION_DISCOUNT
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Compute OU-based expected profit that accounts for time-to-revert and costs.
@@ -356,6 +357,10 @@ def compute_ou_expected_profit(
         Can be DataFrame for per-pair funding.
     bars_per_day : float
         Number of bars per day (1440 for 1-min bars)
+    calibration_discount : float, optional
+        Multiply expected profit by this factor to account for model over-optimism.
+        If None, uses cfg.OU_CALIBRATION_DISCOUNT (default 0.5 = 50% haircut).
+        Set to 1.0 to disable calibration discount.
 
     Returns
     -------
@@ -449,6 +454,21 @@ def compute_ou_expected_profit(
         net_profit = gross_profit - transaction_cost - funding_cost
 
         expected_profit[pair] = net_profit
+
+    # Apply calibration discount to account for model over-optimism
+    # OU model predictions tend to be too optimistic due to:
+    # - Model misspecification (real spreads aren't pure OU)
+    # - Regime changes during trades
+    # - Adverse selection effects
+    if calibration_discount is None:
+        calibration_discount = _cfg_get("OU_CALIBRATION_DISCOUNT", 0.5)
+
+    if calibration_discount < 1.0:
+        logger.info(
+            "Applying OU calibration discount: %.1f%% (multiply expected profit by %.2f)",
+            (1 - calibration_discount) * 100, calibration_discount
+        )
+        expected_profit = expected_profit * calibration_discount
 
     return expected_profit, expected_hold_bars
 

@@ -112,7 +112,7 @@ MIN_DATA_COVERAGE: float = 0.90  # minimum non-missing ratio per coin in train/t
 # Multi-timeframe support # Aggregate 1-min bars to higher timeframes where edge > friction.
 # SIGNAL_TIMEFRAME: Target timeframe for signal generation ("1min", "5min", "15min", "1h")
 # When SIGNAL_TIMEFRAME != "1min", data will be resampled before Kalman/signal computation.
-SIGNAL_TIMEFRAME: str = "15min"  # 15m signals
+SIGNAL_TIMEFRAME: str = "15min"  # Optimal for intraday mean-reversion
 SUPPORTED_TIMEFRAMES: tuple = ("1min", "5min", "15min", "30min", "1h", "4h")
 
 # Walk-forward backtest settings
@@ -291,37 +291,23 @@ MAX_BETA_UNCERTAINTY: float = 0.5  # P[0,0] above this triggers scaling
 # Entry behavior
 CROSS_REVERT_ENTRY: bool = False  # disabled - was filtering too many entries
 
-# Accountant thresholds - LOW-FREQUENCY REDESIGN: Quality over quantity
-# Strategy: Enter at extreme z-scores, hold for days, capture large mean reversions
-# Target: 50-150 trades with >2% profit per trade (before costs)
+# Entry/Exit Thresholds - Optimized for 15min mean-reversion
+ENTRY_Z: float = 2.55         # Entry threshold (z-score standard deviations)
+EXIT_Z: float = 0.5           # Exit threshold (reversion to mean)
+STOP_LOSS_Z: float = 4.0      # Stop-loss threshold
+MAX_ENTRY_Z: float = 6.0      # Maximum entry z-score
+STOP_LOSS_PCT: float = 0.025  # 2.5% maximum loss per trade
 
-ENTRY_Z: float = 3.5          # LOW-FREQ: Extreme threshold for highest quality (top 0.1%)
-                               # Sweet spot: balances selectivity with trade frequency
-
-EXIT_Z: float = 0.5           # LOW-FREQ: Exit close to mean for full profit capture
-                               # Patient exits maximize per-trade profitability
-
-STOP_LOSS_Z: float = 4.0      # LOW-FREQ: Wider stops for longer-term trades
-                               # Give trades more room to breathe before stopping out
-
-MAX_ENTRY_Z: float = 6.0      # Allow very extreme entries
-STOP_LOSS_PCT: float = 0.025  # Wider percentage stop for longer holds
-
-# Expected reversion / profitability filter
+# Profitability filter
 EXPECTED_REVERT_MULT: float = 0.75
-# LOW-FREQ: High profit hurdle for highest quality trades
-# Target: 2-5% profit per trade before costs
-MIN_PROFIT_HURDLE: float = 0.025  # LOW-FREQ: 2.5% minimum expected profit
+MIN_PROFIT_HURDLE: float = 0.012  # 1.2% minimum expected profit
 
 # =============================================================================
-# INFLECTION POINT DETECTION (Option C Redesign)
+# INFLECTION POINT DETECTION
 # =============================================================================
-# Root cause fix: Entries are too early (entering while z-score still expanding)
-# Solution: Wait for z-score to PEAK and start reverting before entering
-
-# Enable inflection filter (wait for z-score peak before entry)
-# CRITICAL: Required for profitability - prevents early entries
-ENABLE_INFLECTION_FILTER: bool = True  # ENABLED - essential for edge
+# Wait for z-score to peak and start reverting before entering
+# Prevents early entries while spread is still diverging
+ENABLE_INFLECTION_FILTER: bool = True
 
 # Minimum bars to wait after z crosses threshold before allowing entry
 # LOW-FREQ: At 1h bars, wait 3 hours for confirmation
@@ -332,12 +318,10 @@ INFLECTION_MIN_BARS_SINCE_EXTREME: int = 3
 INFLECTION_MAX_BARS_SINCE_EXTREME: int = 24
 
 # Velocity must change by this much to confirm reversal
-# LOW-FREQ: Require stronger reversal for high-conviction entries
-INFLECTION_VELOCITY_THRESHOLD: float = -0.08
+INFLECTION_VELOCITY_THRESHOLD: float = -0.06  # Moderate for quality
 
 # Minimum confidence score to trigger entry (0-1)
-# LOW-FREQ: Strict filter for highest quality entries only
-INFLECTION_MIN_CONFIDENCE: float = 0.65  # Proven optimal in testing
+INFLECTION_MIN_CONFIDENCE: float = 0.50  # Relaxed for more trades
 
 # Use acceleration (2nd derivative) for stronger confirmation (experimental)
 INFLECTION_USE_ACCELERATION: bool = False
@@ -358,7 +342,7 @@ MAX_SPREAD_VOLATILITY_BPS: float = 500.0  # Maximum spread vol in bps to enter
 USE_OU_MODEL: bool = True
 
 # Pair selection filters
-MIN_HALF_LIFE_BARS: int = 48       # LOW-FREQ: 2 days at 1h bars (lowered from 80)
+MIN_HALF_LIFE_BARS: int = 80       # Minimum 80 bars (20 hours at 15min)
 MAX_TRADES_PER_PAIR: int = 15     # Allow more trades per pair
 MAX_PAIRS_PER_COIN: int = 3       # Allow more pairs per coin
 EXCLUDE_SYMBOLS: tuple = ()  # Optional symbol blacklist for universe pruning
@@ -367,7 +351,7 @@ ENABLE_BETA_STABILITY_CHECK: bool = True  # Enabled: validate hedge ratio stabil
 ALLOW_SCAN_FALLBACK: bool = True
 SCAN_P_VALUE_THRESHOLD: float = 0.03      # Moderately tightened (was 0.05)
 SCAN_MAX_DRIFT_Z: float = 2.0             # Moderately tightened (was 2.5)
-SCAN_MIN_HALF_LIFE: int = 48              # LOW-FREQ: 2 days at 1h bars (was 80)
+SCAN_MIN_HALF_LIFE: int = 80              # Minimum half-life (aligned with MIN_HALF_LIFE_BARS)
 SCAN_MAX_HALF_LIFE: int = 720             # Moderately lowered (was 2000)
 
 # Optional: validate universe against QuestDB data availability
@@ -388,7 +372,7 @@ DEFAULT_TIME_STOP_BARS: int = 2880     # Keep baseline 30-day stop
 # - "maker_taker_mix": Blend of maker and taker based on fill probability
 # - "maker_only": All trades at maker rate (optimistic)
 # IMPROVEMENT #3: Use maker_taker_mix for more realistic fee assumptions
-FEE_MODEL: str = "maker_taker_mix"  # Changed from taker_only - saves ~60% on fees
+FEE_MODEL: str = "taker_only"  # Conservative: assume all taker fills
 TAKER_FEE_RATE: float = 0.0005   # 5 bps (current exchange taker rate)
 MAKER_FEE_RATE: float = 0.0002   # 2 bps (current exchange maker rate)
 MAKER_FILL_PROBABILITY: float = 0.70  # 70% of limit orders fill at maker rate
@@ -400,7 +384,7 @@ FEE_RATE: float = TAKER_FEE_RATE  # Alias to TAKER_FEE_RATE
 
 # Microstructure / Slippage hook (used in pnl_engine)
 SLIPPAGE_MODEL: str = "fixed"   # {"fixed", "vol_adjusted"}
-SLIPPAGE_BPS: float = 2.0       # Baseline slippage assumption
+SLIPPAGE_BPS: float = 5.0       # Conservative slippage assumption
 SLIPPAGE_RATE: float = SLIPPAGE_BPS / 10_000.0
 SLIPPAGE_VOL_MULT: float = 1.0  # Baseline volatility multiplier
 SLIPPAGE_CAP_BPS: float = 25.0  # safety cap
@@ -411,12 +395,11 @@ SLIPPAGE_CAP_RATE: float = SLIPPAGE_CAP_BPS / 10_000.0
 # - Partial fills and legging risk
 # - Unfavorable fill prices during volatile z-score spikes
 # - Market impact of entering/exiting pairs
-ADVERSE_SELECTION_BPS: float = 2.0  # 2 bps buffer for market impact
+ADVERSE_SELECTION_BPS: float = 5.0  # Conservative buffer for market impact
 
 # Capital assumptions
 # pnl_engine returns (net_pnl / capital_per_pair).
-# POSITION SIZING: Deploy 65% of total capital per trade (without leverage)
-CAPITAL_PER_PAIR: float = 0.65  # 0.65 = 65% allocation (NOT 65x leverage!)
+CAPITAL_PER_PAIR: float = 1.0  # Capital allocation per pair
 INIT_CASH: float = 1.0  # used for equity curves (normalized)
 SCALE_CAPITAL_BY_MAX_POSITIONS: bool = False  # FIXED: Was dividing positions by 200x!
 

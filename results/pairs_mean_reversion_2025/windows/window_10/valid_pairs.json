@@ -1,0 +1,27 @@
+{
+  "pairs": [
+    "MERL-JUP",
+    "TIA-FET",
+    "RENDER-PYTH",
+    "AR-OP",
+    "DOT-FIL",
+    "MERL-kSHIB",
+    "ACE-kPEPE",
+    "ACE-WLD",
+    "WIF-kSHIB",
+    "PYTH-ORDI",
+    "STX-JUP",
+    "ACE-FIL",
+    "OP-INJ",
+    "MOODENG-WLD",
+    "MOODENG-FET",
+    "WIF-STX",
+    "FIL-WIF",
+    "MERL-RENDER",
+    "TIA-WLD",
+    "DOT-FET",
+    "SUI-INJ",
+    "SUI-AVAX",
+    "ZK-INJ"
+  ]
+}

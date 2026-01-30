@@ -8,27 +8,34 @@ This system identifies cryptocurrency pairs that exhibit statistical cointegrati
 
 ## Performance Summary
 
-| Metric | Value |
-|--------|-------|
-| Backtest Period | May 2025 - Jan 2026 |
-| Strategy | Mean-reversion pairs trading |
-| Best Configuration | ENTRY_Z=3.0, EXIT_Z=0.7 |
-| Total Return | +18.76% |
-| Sharpe Ratio | 2.13 |
-| Max Drawdown | 2.26% |
-| Number of Trades | 13 |
-| Win Rate | ~75% |
+| Metric | Base Case | Stress Test |
+|--------|-----------|-------------|
+| **Total Return** | +20.7% | +18.1% |
+| **Sharpe Ratio** | 0.99 | 0.89 |
+| **Calmar Ratio** | 1.54 | 1.30 |
+| **Max Drawdown** | 12.3% | 12.7% |
+| **Total Trades** | 30 | 30 |
+| **Win Rate** | 57% | 57% |
+| **BTC Correlation** | -0.004 | -0.005 |
 
-*Walk-forward validated on 1-hour timeframe with 122 crypto perpetual pairs.*
+| Configuration | Value |
+|--------------|-------|
+| Backtest Period | Jan 2025 - Dec 2025 (12 months) |
+| Signal Timeframe | 15-minute bars |
+| Entry Z-Score | 2.55σ |
+| Exit Z-Score | 0.5σ |
+| Walk-Forward | 90-day train / 21-day test / 14-day step |
+
+*Walk-forward validated across 19 windows with 279 cointegrated pairs tested.*
 
 ### Core Strategy
 
 **Market-Neutral Statistical Arbitrage**
-- Identify cointegrated cryptocurrency pairs (e.g., BTC-ETH, SOL-AVAX)
+- Identify cointegrated cryptocurrency pairs (e.g., TON-ADA, ACE-OP, ZK-MORPHO)
 - Monitor spread deviations using adaptive Kalman filters
-- Enter when spread exceeds 3.0 standard deviations
-- Exit when spread reverts to 0.7 z-score or hits risk limits
-- Profit from mean reversion, not directional moves
+- Enter when spread exceeds 2.55 standard deviations with inflection confirmation
+- Exit when spread reverts to 0.5 z-score or hits risk limits
+- Profit from mean reversion, independent of market direction
 
 **Example Trade:**
 ```
@@ -252,7 +259,7 @@ if kf.kalman_gain > 0.3:
 
 ```python
 # Gate 1: Z-score threshold
-if abs(z_score) < ENTRY_Z:  # 3.0
+if abs(z_score) < ENTRY_Z:  # 2.55
     reject("z_too_low")
 
 # Gate 2: Slope filter (turning point)
@@ -346,24 +353,22 @@ All parameters in `src/backtest/config_backtest.py`:
 
 #### Entry/Exit Thresholds
 ```python
-ENTRY_Z: float = 3.0
+ENTRY_Z: float = 2.55
 # Z-score threshold to enter trade
-# Higher = fewer, higher-quality trades
-# Lower = more trades, potentially lower quality
-# Optimized: 3.0σ deviation (best risk-adjusted returns)
+# Balanced for ~30 trades with 20% annual return
+# Higher = fewer trades, better quality
+# Lower = more trades, diluted edge
 
-EXIT_Z: float = 0.7
+EXIT_Z: float = 0.5
 # Z-score threshold to exit (mean reversion)
-# Lower = exit sooner, capture less profit
-# Higher = exit later, risk reversal
-# Optimized: 0.7 balances profit capture with risk
+# Exit close to mean for full profit capture
 
 STOP_LOSS_Z: float = 4.0
 # Maximum z-score before stop-loss
-# Current: Wide stop (relationship break protection)
+# Wide stop for mean-reversion trades
 
-STOP_LOSS_PCT: float = 0.035
-# Maximum P&L loss (3.5%)
+STOP_LOSS_PCT: float = 0.025
+# Maximum P&L loss (2.5%)
 # Safety net if z-stop doesn't trigger
 ```
 
@@ -440,18 +445,22 @@ WALK_FORWARD_STEP_DAYS: int = 14
 
 ## Backtest Results
 
-### Typical Performance (Current Config)
+### Validated Performance (pairs_mean_reversion_2025)
 
 ```
 Period: 365 days (19 walk-forward windows)
-Pairs Traded: 15-30 per window
-Total Trades: 200-500
-Gross P&L: +0.5% to +2.5% per window
-Net P&L (after costs): +0.2% to +1.5% per window
-Win Rate: 50-60%
-Stop-Loss Rate: 30-40% (target: <35%)
-Sharpe Ratio: 1.0-2.0 (annualized)
-Max Drawdown: 1-3%
+Pairs Universe: 279 cointegrated pairs
+Total Trades: 30
+Gross P&L: +28.1%
+Net P&L (after costs): +20.7%
+Cost/Gross Ratio: 16.5%
+Win Rate: 57%
+Stop-Loss Rate: 30%
+Signal Exit Rate: 63%
+Sharpe Ratio: 0.99 (annualized)
+Calmar Ratio: 1.54
+Max Drawdown: 12.3%
+BTC Correlation: -0.004 (market neutral)
 ```
 
 ### Output Files
@@ -842,6 +851,6 @@ Contributions welcome! Please:
 
 ---
 
-**Built with:** Python 3.11 | QuestDB | Numba | scikit-learn | pandas | Docker
+**Built with:** Python 3.12 | QuestDB | Numba | scikit-learn | pandas | Docker
 
-**Status:** Research Complete | v1.2.0
+**Status:** Research Complete | Backtest Validated | v1.2.0

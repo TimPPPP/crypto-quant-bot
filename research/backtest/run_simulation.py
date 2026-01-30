@@ -109,7 +109,9 @@ from src.backtest.symbol_blacklist import SymbolBlacklist
 
 # Phase 2: Fix the edge - pair scoring and regime filtering
 from src.models.pair_scorer import PairScorer, PairScore
-from src.adaptive.regime_filter import RegimeFilter
+from src.adaptive.regime_filter import RegimeFilter, RegimeState
+from src.adaptive.live_regime_tracker import LiveRegimeTracker, create_live_regime_tracker
+from src.adaptive.regime_parameters import RegimeParameters, create_regime_parameters
 
 # Phase 5B: Window analysis for regime pattern detection
 from src.backtest.window_analysis import WindowAnalysis, create_window_analysis
@@ -190,6 +192,43 @@ def save_entry_funnel(funnel: EntryFunnel, window_dir: Path) -> None:
         funnel.final_executed,
         funnel.compute_conversion_rate(),
     )
+
+
+# ------------------------------ Multi-Timeframe Window -------------------------------- #
+
+@dataclass
+class MultiTimeframeWindow:
+    """
+    Walk-forward window with multi-timeframe training data.
+
+    Structure:
+        [Long-term 180d] -> [Short-term 30d subset] -> [Test 21d]
+
+    The short_term_train is the last N days of long_term_train,
+    used for regime-aware validation of pairs found in long-term.
+    """
+    long_term_train: pd.DataFrame      # Full long-term training window (e.g., 180 days)
+    short_term_train: pd.DataFrame     # Recent subset for regime validation (e.g., last 30 days)
+    test: pd.DataFrame                 # Out-of-sample test window
+    train_start: pd.Timestamp          # Start of long-term window
+    short_term_start: pd.Timestamp     # Start of short-term subset
+    train_end: pd.Timestamp            # End of training (start of test)
+    test_end: pd.Timestamp             # End of test window
+
+    @property
+    def long_term_days(self) -> int:
+        """Number of days in long-term training window."""
+        return (self.train_end - self.train_start).days
+
+    @property
+    def short_term_days(self) -> int:
+        """Number of days in short-term training window."""
+        return (self.train_end - self.short_term_start).days
+
+    @property
+    def test_days(self) -> int:
+        """Number of days in test window."""
+        return (self.test_end - self.train_end).days
 
 
 # ------------------------------ utilities -------------------------------- #
@@ -998,6 +1037,95 @@ def _build_walk_forward_windows(
     return windows
 
 
+def _build_walk_forward_windows_multi_tf(
+    df: pd.DataFrame,
+    long_term_days: int,
+    short_term_days: int,
+    test_days: int,
+    step_days: int,
+) -> List[MultiTimeframeWindow]:
+    """
+    Build walk-forward windows with multi-timeframe training data.
+
+    Each window contains:
+    - long_term_train: Full training period (e.g., 180 days) for stable pair discovery
+    - short_term_train: Recent subset (e.g., last 30 days) for regime validation
+    - test: Out-of-sample test period (e.g., 21 days)
+
+    Args:
+        df: Full price DataFrame with datetime index
+        long_term_days: Length of long-term training window (e.g., 180)
+        short_term_days: Length of short-term subset at end of training (e.g., 30)
+        test_days: Length of test window (e.g., 21)
+        step_days: How much to slide window between iterations (e.g., 14)
+
+    Returns:
+        List of MultiTimeframeWindow objects
+    """
+    if any(d <= 0 for d in [long_term_days, short_term_days, test_days, step_days]):
+        raise ValueError("All window parameters must be positive.")
+    if short_term_days >= long_term_days:
+        raise ValueError(
+            f"short_term_days ({short_term_days}) must be less than "
+            f"long_term_days ({long_term_days})"
+        )
+
+    start = df.index.min()
+    windows: List[MultiTimeframeWindow] = []
+    cur_start = start
+
+    while True:
+        train_start = cur_start
+        train_end = train_start + pd.Timedelta(days=long_term_days)
+        test_end = train_end + pd.Timedelta(days=test_days)
+
+        # Check if we have enough data
+        if test_end > df.index.max():
+            break
+
+        # Extract data slices
+        long_term_train = df[(df.index >= train_start) & (df.index < train_end)]
+        test_df = df[(df.index >= train_end) & (df.index < test_end)]
+
+        if long_term_train.empty or test_df.empty:
+            break
+
+        # Short-term is the last N days of long-term training
+        short_term_start = train_end - pd.Timedelta(days=short_term_days)
+        short_term_train = df[(df.index >= short_term_start) & (df.index < train_end)]
+
+        if short_term_train.empty:
+            logger.warning(
+                "Short-term train window is empty for period %s - %s, skipping",
+                short_term_start,
+                train_end,
+            )
+            cur_start = cur_start + pd.Timedelta(days=step_days)
+            continue
+
+        window = MultiTimeframeWindow(
+            long_term_train=long_term_train,
+            short_term_train=short_term_train,
+            test=test_df,
+            train_start=train_start,
+            short_term_start=short_term_start,
+            train_end=train_end,
+            test_end=test_end,
+        )
+        windows.append(window)
+        cur_start = cur_start + pd.Timedelta(days=step_days)
+
+    logger.info(
+        "Built %d multi-timeframe windows (long=%dd, short=%dd, test=%dd, step=%dd)",
+        len(windows),
+        long_term_days,
+        short_term_days,
+        test_days,
+        step_days,
+    )
+    return windows
+
+
 # ------------------------------ main pipeline ----------------------------- #
 
 def run_backtest(
@@ -1084,7 +1212,43 @@ def run_backtest(
             use_exp_weighting,
         )
 
-        windows = _build_walk_forward_windows(full_df, wf_train, wf_test, wf_step)
+        # Check for multi-timeframe training mode
+        use_multi_tf = bool(getattr(cfg, "ENABLE_MULTI_TIMEFRAME_TRAINING", False))
+
+        if use_multi_tf:
+            # Multi-timeframe windows with long-term + short-term training
+            multi_tf_long_days = int(getattr(cfg, "MULTI_TF_LONG_TERM_DAYS", 180))
+            multi_tf_short_days = int(getattr(cfg, "MULTI_TF_SHORT_TERM_DAYS", 30))
+
+            logger.info(
+                "Multi-timeframe training ENABLED: long=%dd, short=%dd (last %dd of training)",
+                multi_tf_long_days,
+                multi_tf_short_days,
+                multi_tf_short_days,
+            )
+
+            multi_tf_windows = _build_walk_forward_windows_multi_tf(
+                full_df,
+                long_term_days=multi_tf_long_days,
+                short_term_days=multi_tf_short_days,
+                test_days=wf_test,
+                step_days=wf_step,
+            )
+            if not multi_tf_windows:
+                raise RuntimeError("Walk-forward produced 0 multi-TF windows. Check date span and window sizes.")
+
+            # Convert to standard tuple format for compatibility with existing loop
+            # But also store the multi-TF windows for two-stage pair selection
+            windows = [
+                (w.long_term_train, w.test, w.train_start, w.train_end, w.test_end)
+                for w in multi_tf_windows
+            ]
+            # Store multi-TF windows for two-stage pair selection
+            _multi_tf_windows_store = multi_tf_windows
+        else:
+            windows = _build_walk_forward_windows(full_df, wf_train, wf_test, wf_step)
+            _multi_tf_windows_store = None
+
         if not windows:
             raise RuntimeError("Walk-forward produced 0 windows. Check date span and window sizes.")
 
@@ -1431,10 +1595,115 @@ def run_backtest(
         scan_with_rolling = bool(getattr(cfg, "ENABLE_ROLLING_COINT_CHECK", False))
         scan_with_beta = bool(getattr(cfg, "ENABLE_BETA_STABILITY_CHECK", False))
 
+        # Check for multi-timeframe consensus pair selection
+        use_multi_tf_consensus = (
+            bool(getattr(cfg, "ENABLE_MULTI_TIMEFRAME_TRAINING", False))
+            and bool(getattr(cfg, "MULTI_TF_REQUIRE_CONSENSUS", True))
+            and _multi_tf_windows_store is not None
+            and w_idx < len(_multi_tf_windows_store)
+        )
+
         # Check for two-stage pair selection (expert crypto suggestion)
         use_two_stage = bool(getattr(cfg, "ENABLE_TWO_STAGE_PAIR_SELECTION", False))
 
-        if use_two_stage:
+        if use_multi_tf_consensus:
+            # Multi-timeframe consensus pair selection:
+            # 1. Find stable pairs from long-term window (stricter p-value)
+            # 2. Validate pairs still work in short-term window (looser p-value)
+            # 3. Only keep pairs that pass both (consensus)
+            mtf_window = _multi_tf_windows_store[w_idx]
+            long_term_pval = float(getattr(cfg, "MULTI_TF_LONG_TERM_PVALUE", 0.02))
+            short_term_pval = float(getattr(cfg, "MULTI_TF_SHORT_TERM_PVALUE", 0.05))
+
+            logger.info(
+                "Multi-TF CONSENSUS pair selection: long-term p<%.3f, short-term p<%.3f",
+                long_term_pval,
+                short_term_pval,
+            )
+
+            # Stage 1: Find stable pairs from long-term (180d) window
+            long_term_scanner = CointegrationScanner(
+                cluster_map=cluster_map,
+                p_value_threshold=long_term_pval,  # Stricter for stability
+                max_drift_z=float(getattr(cfg, "SCAN_MAX_DRIFT_Z", 3.0)),
+                min_half_life=float(regime_half_life_min),
+                max_half_life=float(regime_half_life_max),
+            )
+            long_term_output = long_term_scanner.find_pairs_from_matrix(
+                mtf_window.long_term_train,
+                train_ratio=0.8,
+                check_rolling_coint=scan_with_rolling,
+                check_beta_stability=scan_with_beta,
+            )
+            long_term_pairs, long_term_df = _coerce_pairs_list(long_term_output)
+            long_term_pairs = [p for p in long_term_pairs if isinstance(p, str)]
+
+            logger.info(
+                "Stage 1 (long-term %dd, p<%.3f): found %d candidate pairs",
+                mtf_window.long_term_days,
+                long_term_pval,
+                len(long_term_pairs),
+            )
+
+            if not long_term_pairs:
+                # Fallback: use standard scanner if no long-term pairs
+                logger.warning("No long-term pairs found, falling back to standard scanner")
+                scanner_output = scanner.find_pairs_from_matrix(
+                    train_df,
+                    train_ratio=0.8,
+                    check_rolling_coint=scan_with_rolling,
+                    check_beta_stability=scan_with_beta,
+                )
+            else:
+                # Stage 2: Validate pairs in short-term (30d) window
+                short_term_scanner = CointegrationScanner(
+                    cluster_map=cluster_map,
+                    p_value_threshold=short_term_pval,  # Looser for validation
+                    max_drift_z=float(getattr(cfg, "SCAN_MAX_DRIFT_Z", 3.0)),
+                    min_half_life=float(regime_half_life_min),
+                    max_half_life=float(regime_half_life_max),
+                )
+                short_term_output = short_term_scanner.find_pairs_from_matrix(
+                    mtf_window.short_term_train,
+                    train_ratio=0.8,
+                    check_rolling_coint=False,  # Don't need rolling check for validation
+                    check_beta_stability=False,
+                )
+                short_term_pairs, short_term_df = _coerce_pairs_list(short_term_output)
+                short_term_pairs_set = set(p for p in short_term_pairs if isinstance(p, str))
+
+                # Consensus: pairs must pass both long-term and short-term
+                consensus_pairs = [p for p in long_term_pairs if p in short_term_pairs_set]
+
+                logger.info(
+                    "Stage 2 (short-term %dd, p<%.3f): %d pairs valid, consensus: %d/%d (%.1f%%)",
+                    mtf_window.short_term_days,
+                    short_term_pval,
+                    len(short_term_pairs_set),
+                    len(consensus_pairs),
+                    len(long_term_pairs),
+                    100 * len(consensus_pairs) / max(len(long_term_pairs), 1),
+                )
+
+                # Use consensus pairs with long-term DataFrame for metadata
+                if consensus_pairs:
+                    # Filter long_term_df to only consensus pairs
+                    if long_term_df is not None and not long_term_df.empty:
+                        if 'pair' in long_term_df.columns:
+                            scanner_output = (consensus_pairs, long_term_df[long_term_df['pair'].isin(consensus_pairs)])
+                        else:
+                            scanner_output = (consensus_pairs, long_term_df)
+                    else:
+                        scanner_output = (consensus_pairs, pd.DataFrame())
+                else:
+                    # Fallback: if no consensus, use long-term pairs with warning
+                    logger.warning(
+                        "No consensus pairs found! Using %d long-term pairs instead",
+                        len(long_term_pairs),
+                    )
+                    scanner_output = long_term_output
+
+        elif use_two_stage:
             logger.info("Using TWO-STAGE pair selection...")
             scanner_output = scanner.find_pairs_two_stage(
                 price_matrix=train_df,
@@ -2056,7 +2325,89 @@ def run_backtest(
             except Exception as e:
                 logger.warning("Entry quality filters failed: %s. Proceeding without quality filters.", e)
 
-        # ===== PHASE 2: Apply regime filter to entries =====
+        # ===== PHASE 2a: Live Regime Tracking (Dynamic Updates) =====
+        # Updates regime state during test execution rather than freezing at window start
+        enable_live_regime = bool(getattr(cfg, "ENABLE_LIVE_REGIME_UPDATES", False))
+        live_regime_tracker = None
+        live_regime_size_multiplier = None
+        live_regime_entry_allowed = None
+
+        if enable_live_regime and btc_symbol in train_df.columns and btc_symbol in test_df.columns:
+            try:
+                # Initialize tracker from training BTC prices
+                btc_prices_train = train_df[btc_symbol].dropna()
+                live_regime_tracker = create_live_regime_tracker(btc_prices_train)
+
+                # Get test BTC prices for simulation
+                btc_prices_test = test_df[btc_symbol]
+
+                # Simulate the tracker for all test bars to get regime states
+                n_test_bars = len(btc_prices_test)
+                for bar_idx in range(n_test_bars):
+                    btc_price = btc_prices_test.iloc[bar_idx]
+                    timestamp = btc_prices_test.index[bar_idx] if hasattr(btc_prices_test.index, '__getitem__') else None
+                    live_regime_tracker.update(bar_idx, btc_price, timestamp)
+
+                # Generate state series from tracker
+                state_series, size_mult_series, entry_allowed_series = \
+                    live_regime_tracker.get_state_series(n_test_bars)
+
+                # Convert to DataFrames aligned with entries
+                live_regime_size_multiplier = pd.DataFrame(
+                    {pair: size_mult_series.values for pair in entries.columns},
+                    index=entries.index[:n_test_bars] if len(entries.index) >= n_test_bars else entries.index,
+                )
+                live_regime_entry_allowed = pd.DataFrame(
+                    {pair: entry_allowed_series.values for pair in entries.columns},
+                    index=entries.index[:n_test_bars] if len(entries.index) >= n_test_bars else entries.index,
+                )
+
+                # Align with entries index (handle any length mismatch)
+                live_regime_size_multiplier = live_regime_size_multiplier.reindex(entries.index).ffill().fillna(1.0)
+                live_regime_entry_allowed = live_regime_entry_allowed.reindex(entries.index).ffill().fillna(True)
+
+                # Apply live regime entry mask
+                entries_before_live_regime = int(entries.sum().sum())
+                entries = entries & live_regime_entry_allowed
+
+                # Get tracker summary for logging
+                tracker_summary = live_regime_tracker.get_summary()
+                logger.info(
+                    "Live regime tracker: %d transitions, GREEN=%.1f%%, YELLOW=%.1f%%, RED=%.1f%% | blocked %d/%d entries",
+                    tracker_summary["n_transitions"],
+                    tracker_summary["pct_green"],
+                    tracker_summary["pct_yellow"],
+                    tracker_summary["pct_red"],
+                    entries_before_live_regime - int(entries.sum().sum()),
+                    entries_before_live_regime,
+                )
+
+            except Exception as e:
+                logger.warning("Live regime tracker failed: %s. Proceeding without live regime updates.", e)
+                live_regime_tracker = None
+                live_regime_size_multiplier = None
+
+        # ===== PHASE 2a.2: Apply regime-conditional parameters =====
+        # Regime-conditional max_positions limits exposure during adverse regimes
+        # Note: Entry_z filtering is NOT applied here since base ENTRY_Z (3.3) is already
+        # stricter than regime thresholds. Entry blocking for RED is handled by live_regime_entry_allowed.
+        enable_regime_params = bool(getattr(cfg, "ENABLE_REGIME_CONDITIONAL_PARAMS", False))
+        regime_params = None
+
+        if enable_regime_params and enable_live_regime and live_regime_tracker is not None:
+            try:
+                regime_params = create_regime_parameters()
+                logger.info(
+                    "Regime-conditional params enabled: GREEN(z=%.1f, pos=%d), YELLOW(z=%.1f, pos=%d), RED(z=%.1f, pos=%d)",
+                    regime_params.green.entry_z, regime_params.green.max_positions,
+                    regime_params.yellow.entry_z, regime_params.yellow.max_positions,
+                    regime_params.red.entry_z, regime_params.red.max_positions,
+                )
+            except Exception as e:
+                logger.warning("Regime-conditional parameters failed: %s. Using default parameters.", e)
+                regime_params = None
+
+        # ===== PHASE 2b: Apply static regime filter to entries =====
         # Block entries during adverse market regimes (high BTC vol, high dispersion)
         # Supports both hard block (legacy) and soft 3-state gating (Phase 6)
         regime_size_multiplier = None  # For soft regime: position size adjustment
@@ -2428,6 +2779,29 @@ def run_backtest(
                     position_size_multiplier.mean().mean(),
                 )
 
+        # 8.9) Integrate live regime size multiplier (dynamic regime updates)
+        # Apply live regime-based position size adjustment (YELLOW state = 0.5x, RED state = 0.0x)
+        if enable_live_regime and live_regime_size_multiplier is not None:
+            if position_size_multiplier is not None:
+                # Multiply existing size multiplier by live regime factor
+                position_size_multiplier = position_size_multiplier * live_regime_size_multiplier
+                logger.info(
+                    "Applied live regime size adjustment: min=%.3f, max=%.3f, mean=%.3f",
+                    position_size_multiplier.min().min(),
+                    position_size_multiplier.max().max(),
+                    position_size_multiplier.mean().mean(),
+                )
+            else:
+                # Use live regime size directly as position multiplier
+                position_size_multiplier = live_regime_size_multiplier
+                enable_advanced_sizing = True  # Enable to use the multiplier
+                logger.info(
+                    "Using live regime sizing as position multiplier: min=%.3f, max=%.3f, mean=%.3f",
+                    position_size_multiplier.min().min(),
+                    position_size_multiplier.max().max(),
+                    position_size_multiplier.mean().mean(),
+                )
+
         # 9) PnL engine
         logger.info("Running PnL engine (Numba state machine)...")
         max_hold_bars = pnl_engine.compute_time_stops_from_half_life(
@@ -2447,6 +2821,40 @@ def run_backtest(
         else:
             max_positions_total = int(getattr(cfg, "MAX_PORTFOLIO_POSITIONS", 8))
             max_positions_per_coin = int(getattr(cfg, "MAX_POSITIONS_PER_COIN", 2))
+
+        # Apply regime-conditional max_positions if enabled
+        # Uses the minimum max_positions from regime distribution to be conservative
+        if enable_regime_params and regime_params is not None and live_regime_tracker is not None:
+            try:
+                tracker_summary = live_regime_tracker.get_summary()
+                pct_green = tracker_summary["pct_green"] / 100.0
+                pct_yellow = tracker_summary["pct_yellow"] / 100.0
+                pct_red = tracker_summary["pct_red"] / 100.0
+
+                # Weighted average max_positions based on regime distribution
+                regime_max_pos = (
+                    pct_green * regime_params.green.max_positions +
+                    pct_yellow * regime_params.yellow.max_positions +
+                    pct_red * regime_params.red.max_positions
+                )
+
+                # Use floor to be conservative (round down)
+                regime_adjusted_max_positions = max(1, int(regime_max_pos))
+
+                # Only reduce, never increase beyond config
+                if regime_adjusted_max_positions < max_positions_total:
+                    logger.info(
+                        "Regime-conditional max_positions: %d -> %d (GREEN=%.0f%%, YELLOW=%.0f%%, RED=%.0f%%)",
+                        max_positions_total,
+                        regime_adjusted_max_positions,
+                        pct_green * 100,
+                        pct_yellow * 100,
+                        pct_red * 100,
+                    )
+                    max_positions_total = regime_adjusted_max_positions
+
+            except Exception as e:
+                logger.warning("Failed to apply regime-conditional max_positions: %s", e)
 
         capital_per_pair = cfg.CAPITAL_PER_PAIR
         # CRITICAL FIX: Always scale capital_per_pair by max_positions to prevent
@@ -3258,6 +3666,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--no-strict", action="store_true", help="Disable strict data validation (warn on gaps instead of error).")
     p.add_argument("--pretrained-risk-model", type=str, default=None, help="Path to pre-trained risk predictor pickle (applies from window 0).")
     p.add_argument("--config-overrides", type=str, default=None, help="Path to JSON file with config overrides (for batch experiments).")
+
+    # Phase 1 parameter overrides (for parameter sweep)
+    p.add_argument("--entry-z", type=float, default=None, help="Override ENTRY_Z threshold.")
+    p.add_argument("--exit-z", type=float, default=None, help="Override EXIT_Z threshold.")
+    p.add_argument("--coint-pvalue", type=float, default=None, help="Override COINT_PVALUE_THRESHOLD.")
+
     return p
 
 
@@ -3285,6 +3699,22 @@ if __name__ == "__main__":
     # Apply config overrides if provided (for batch experiments)
     if args.config_overrides:
         apply_config_overrides(Path(args.config_overrides))
+
+    # Apply direct parameter overrides (for parameter sweep)
+    if args.entry_z is not None:
+        old_val = cfg.ENTRY_Z
+        cfg.ENTRY_Z = args.entry_z
+        logger.info("Parameter override: ENTRY_Z = %s (was %s)", args.entry_z, old_val)
+
+    if args.exit_z is not None:
+        old_val = cfg.EXIT_Z
+        cfg.EXIT_Z = args.exit_z
+        logger.info("Parameter override: EXIT_Z = %s (was %s)", args.exit_z, old_val)
+
+    if args.coint_pvalue is not None:
+        old_val = cfg.COINT_PVALUE_THRESHOLD
+        cfg.COINT_PVALUE_THRESHOLD = args.coint_pvalue
+        logger.info("Parameter override: COINT_PVALUE_THRESHOLD = %s (was %s)", args.coint_pvalue, old_val)
 
     result = run_backtest(
         run_name=args.run_name,

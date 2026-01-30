@@ -1,0 +1,74 @@
+# Data directories (largest - ~3GB)
+data/
+data/db/
+data/raw_downloads/
+data/parquet/
+data/state/
+data/performance/
+
+# Archived code and old results
+archive/
+results/
+backups/
+
+# Git metadata
+.git/
+.gitignore
+.github/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE and editor files
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Jupyter artifacts
+.ipynb_checkpoints/
+*.ipynb
+
+# Documentation and notes
+*.md
+!README.md
+docs/
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# Environment files (use docker-compose env)
+.env
+.env.local
+.envrc
+
+# Test and coverage
+htmlcov/
+.coverage
+.tox/
+
+# Logs
+*.log
+
+# Docker files themselves
+docker-compose*.yml
+Dockerfile*
+.dockerignore
+
+# Claude plans
+.claude/

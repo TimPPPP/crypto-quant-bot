@@ -1,0 +1,18 @@
+{
+  "window_idx": 11,
+  "raw_z_entries": 107,
+  "after_spread_vol": 107,
+  "after_trend_overlay": 107,
+  "after_regime": 3,
+  "after_cooldown": 3,
+  "final_executed": 3,
+  "btc_vol_blocked": 0,
+  "dispersion_blocked": 0,
+  "spread_vol_low_blocked": 0,
+  "spread_vol_high_blocked": 0,
+  "btc_vol_ok_pct": 0.0,
+  "dispersion_ok_pct": 0.0,
+  "spread_vol_ok_pct": 0.0,
+  "conversion_rate_pct": "2.80%",
+  "biggest_blocker": "regime (97.2% blocked)"
+}
