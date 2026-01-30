@@ -1,7 +1,7 @@
 """
 src/backtest/window_analysis.py
 
-Phase 5B: Walk-Forward Window Analysis
+Walk-Forward Window Analysis
 
 Analyzes market conditions during walk-forward windows to understand what
 differentiates winning vs losing windows. This helps identify regime patterns

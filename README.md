@@ -6,13 +6,28 @@ A sophisticated statistical arbitrage system for cryptocurrency markets using co
 
 This system identifies cryptocurrency pairs that exhibit statistical cointegration and trades temporary divergences from equilibrium. The strategy is market-neutral, generating returns independent of overall market direction by simultaneously holding long and short positions in cointegrated pairs.
 
+## Performance Summary
+
+| Metric | Value |
+|--------|-------|
+| Backtest Period | May 2025 - Jan 2026 |
+| Strategy | Mean-reversion pairs trading |
+| Best Configuration | ENTRY_Z=3.0, EXIT_Z=0.7 |
+| Total Return | +18.76% |
+| Sharpe Ratio | 2.13 |
+| Max Drawdown | 2.26% |
+| Number of Trades | 13 |
+| Win Rate | ~75% |
+
+*Walk-forward validated on 1-hour timeframe with 122 crypto perpetual pairs.*
+
 ### Core Strategy
 
 **Market-Neutral Statistical Arbitrage**
 - Identify cointegrated cryptocurrency pairs (e.g., BTC-ETH, SOL-AVAX)
 - Monitor spread deviations using adaptive Kalman filters
-- Enter when spread exceeds 3.3 standard deviations
-- Exit when spread reverts to mean or hits risk limits
+- Enter when spread exceeds 3.0 standard deviations
+- Exit when spread reverts to 0.7 z-score or hits risk limits
 - Profit from mean reversion, not directional moves
 
 **Example Trade:**
@@ -237,7 +252,7 @@ if kf.kalman_gain > 0.3:
 
 ```python
 # Gate 1: Z-score threshold
-if abs(z_score) < ENTRY_Z:  # 3.3
+if abs(z_score) < ENTRY_Z:  # 3.0
     reject("z_too_low")
 
 # Gate 2: Slope filter (turning point)
@@ -331,17 +346,17 @@ All parameters in `src/backtest/config_backtest.py`:
 
 #### Entry/Exit Thresholds
 ```python
-ENTRY_Z: float = 3.3
+ENTRY_Z: float = 3.0
 # Z-score threshold to enter trade
 # Higher = fewer, higher-quality trades
 # Lower = more trades, potentially lower quality
-# Current: Very selective (3.3σ deviation)
+# Optimized: 3.0σ deviation (best risk-adjusted returns)
 
-EXIT_Z: float = 0.2
+EXIT_Z: float = 0.7
 # Z-score threshold to exit (mean reversion)
 # Lower = exit sooner, capture less profit
 # Higher = exit later, risk reversal
-# Current: Let winners run
+# Optimized: 0.7 balances profit capture with risk
 
 STOP_LOSS_Z: float = 4.0
 # Maximum z-score before stop-loss
@@ -410,12 +425,12 @@ WALK_FORWARD_STEP_DAYS: int = 14
 ### Parameter Tuning Guide
 
 **To increase trade count:**
-- Lower `ENTRY_Z` (e.g., 3.3 → 2.5) ⚠️ May reduce quality
+- Lower `ENTRY_Z` (e.g., 3.0 → 2.5) ⚠️ May reduce quality
 - Relax regime filter (increase percentiles) ⚠️ Higher risk
 - Increase `MAX_PORTFOLIO_POSITIONS` (e.g., 8 → 12)
 
 **To improve trade quality:**
-- Raise `ENTRY_Z` (e.g., 3.3 → 3.8)
+- Raise `ENTRY_Z` (e.g., 3.0 → 3.5)
 - Stricter regime filter (lower percentiles)
 - Lower `COINT_PVALUE_THRESHOLD` (e.g., 0.03 → 0.01)
 
@@ -796,11 +811,6 @@ docker-compose up -d
 - "Algorithmic Trading" by Ernie Chan
 - "Quantitative Trading" by Ernie Chan
 
-**Documentation:**
-- [Kalman Filter Explained](docs/kalman_filter.md)
-- [Walk-Forward Backtesting](docs/walk_forward.md)
-- [Parameter Tuning Guide](docs/parameter_tuning.md)
-
 ## License
 
 MIT License - See LICENSE file for details
@@ -834,4 +844,4 @@ Contributions welcome! Please:
 
 **Built with:** Python 3.11 | QuestDB | Numba | scikit-learn | pandas | Docker
 
-**Status:** Active Development | v1.2.0
+**Status:** Research Complete | v1.2.0

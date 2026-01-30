@@ -37,8 +37,7 @@ class PairKillSwitch:
     """
     Track per-pair performance and disable underperformers in real-time.
 
-    This is a key Phase 1 component for "stopping the bleeding" - preventing
-    pairs like ETHFI-AVAX (20.8% win rate, -2.06% loss) from continuing to trade.
+    Prevents underperforming pairs from continuing to trade.
 
     Kill conditions (any triggers retirement):
     1. Win rate < min_win_rate after min_trades

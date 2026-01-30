@@ -21,7 +21,7 @@ except ImportError:
 
 
 # =============================================================================
-# FDR Control (Issue #1 fix: Multiple Testing Correction)
+# FDR Control (Multiple Testing Correction)
 # =============================================================================
 
 def apply_fdr_correction(
@@ -32,7 +32,7 @@ def apply_fdr_correction(
     """
     Apply False Discovery Rate (FDR) correction to cointegration p-values.
 
-    Issue #1 Fix: When scanning many pairs, p-value < 0.05 will produce many
+    When scanning many pairs, p-value < 0.05 will produce many
     false positives. FDR control adjusts the threshold based on the number
     of tests to maintain the expected false discovery rate.
 
@@ -127,7 +127,7 @@ class CointegrationScanner:
     - Configurable thresholds
     - NEW: Can scan either
         (a) from the DataLoader (legacy research mode), OR
-        (b) from an already-prepared price matrix (Phase 5 backtest mode)
+        (b) from an already-prepared price matrix (backtest mode)
     """
 
     DEFAULT_P_VALUE = 0.03  # Cointegration requirement (moderately tightened from 0.05)
@@ -136,7 +136,7 @@ class CointegrationScanner:
     DEFAULT_MIN_HALF_LIFE = 80  # Min half-life bars (moderately raised from 60)
     DEFAULT_MAX_HALF_LIFE = 720  # Max half-life bars (moderately lowered from 2000)
 
-    # Rolling cointegration diagnostics (Problem #3 fix)
+    # Rolling cointegration diagnostics
     DEFAULT_MAX_COINT_FAILURE_RATE = 0.3  # Reject if >30% of rolling windows fail ADF
     DEFAULT_MAX_BETA_DRIFT = 0.5  # Reject if beta drifts by >50% of initial value
 
@@ -291,7 +291,7 @@ class CointegrationScanner:
         """
         Compute cointegration with exponential decay weighting.
 
-        Issue #2 Fix: Long training windows can dilute the "current relationship".
+        Long training windows can dilute the current relationship.
         Exponential weighting gives more importance to recent observations.
 
         Parameters
@@ -399,7 +399,7 @@ class CointegrationScanner:
         """
         Run Kalman filter on training data and verify the resulting spread is stationary.
 
-        Issue #3 Fix: Scanner uses OLS beta for cointegration test, but trading uses
+        Scanner uses OLS beta for cointegration test, but trading uses
         Kalman beta. This function validates that the Kalman-implied spread is also
         stationary and that the betas don't diverge too much.
 
@@ -598,7 +598,7 @@ class CointegrationScanner:
         """
         Rolling ADF test to detect cointegration breakdowns.
 
-        Problem #3 Fix: Cointegration in crypto is regime-dependent. This function
+        Cointegration in crypto is regime-dependent. This function
         tests stationarity over rolling windows to detect instability.
 
         Parameters
@@ -676,7 +676,7 @@ class CointegrationScanner:
         """
         Split training data into n subwindows and verify cointegration holds in each.
 
-        Issue #1 Fix: A pair might pass cointegration on the full training window
+        A pair might pass cointegration on the full training window
         but fail in individual subwindows. This indicates the relationship is not
         stable and likely regime-dependent.
 
@@ -815,7 +815,7 @@ class CointegrationScanner:
         """
         Track how much beta drifts over time using rolling OLS.
 
-        Problem #3 Fix: If beta drifts significantly, the "cointegration" is really
+        If beta drifts significantly, the "cointegration" is really
         just a moving linear fit that can break suddenly.
 
         Parameters
@@ -949,7 +949,7 @@ class CointegrationScanner:
         if half_life < self.min_half_life or half_life > self.max_half_life:
             return None, f"Bad Half-Life ({half_life:.1f} bars, need {self.min_half_life}-{self.max_half_life})"
 
-        # Rolling cointegration check (Problem #3 fix)
+        # Rolling cointegration check
         rolling_stats = {}
         if check_rolling_coint:
             rolling_stats = self.compute_rolling_coint_stats(train_spread)
@@ -957,7 +957,7 @@ class CointegrationScanner:
                 if rolling_stats['failure_rate'] > self.DEFAULT_MAX_COINT_FAILURE_RATE:
                     return None, f"Rolling coint unstable (failure_rate={rolling_stats['failure_rate']:.2f})"
 
-        # Beta stability check (Problem #3 fix)
+        # Beta stability check
         beta_stats = {}
         if check_beta_stability:
             beta_stats = self.compute_beta_stability(train_y, train_x)
@@ -1091,7 +1091,7 @@ class CointegrationScanner:
         volume_data : pd.DataFrame, optional
             Dollar volume data for liquidity pre-filtering (same columns as prices)
         min_daily_volume_usd : float
-            Minimum average daily volume in USD to include a coin (Phase 5A)
+            Minimum average daily volume in USD to include a coin
         """
         if prices.empty:
             return pd.DataFrame()
@@ -1108,7 +1108,7 @@ class CointegrationScanner:
 
         logger.info(f"Data Split: {len(train_data)} Train rows, {len(val_data)} Validation rows.")
 
-        # Phase 5A: Pre-compute liquid coins set for efficiency
+        # Pre-compute liquid coins set for efficiency
         liquid_coins_set: Optional[set] = None
         if volume_data is not None and min_daily_volume_usd > 0:
             # Compute average daily volume per coin
@@ -1125,7 +1125,7 @@ class CointegrationScanner:
         for cluster_id, coins in self.cluster_map.items():
             available_coins = [c for c in coins if c in prices.columns]
 
-            # Phase 5A: Apply liquidity filter
+            # Apply liquidity filter
             if liquid_coins_set is not None:
                 available_coins = [c for c in available_coins if c in liquid_coins_set]
 
@@ -1205,11 +1205,11 @@ class CointegrationScanner:
         train_ratio: float = 0.90,
         check_rolling_coint: bool = False,  # Disabled by default - expensive and can be too strict
         check_beta_stability: bool = False,  # Disabled by default - expensive and can be too strict
-        volume_data: Optional[pd.DataFrame] = None,  # Phase 5A: liquidity pre-filter
-        min_daily_volume_usd: float = 0.0,  # Phase 5A: minimum daily volume
+        volume_data: Optional[pd.DataFrame] = None,  # Liquidity pre-filter
+        min_daily_volume_usd: float = 0.0,  # Minimum daily volume
     ) -> pd.DataFrame:
         """
-        Phase 5 backtest entrypoint:
+        Backtest entrypoint:
         scans for cointegrated pairs using an already-prepared price matrix (train_df).
 
         price_matrix must be wide:
@@ -1227,7 +1227,7 @@ class CointegrationScanner:
             If True, check for excessive beta drift over time.
         volume_data : pd.DataFrame, optional
             Dollar volume data for liquidity pre-filtering (columns = symbols)
-            Phase 5A improvement: filter illiquid coins before expensive coint tests.
+            Filter illiquid coins before expensive cointegration tests.
         min_daily_volume_usd : float
             Minimum average daily volume in USD to include a coin.
             Default 0.0 means no filtering.

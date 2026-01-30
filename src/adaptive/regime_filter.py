@@ -72,8 +72,7 @@ class RegimeFilter:
     """
     Filter entries based on market regime indicators.
 
-    This is a key Phase 2 component for "fixing the edge" - preventing
-    entries during market regimes where pairs trading fails.
+    Filter entries during market regimes where pairs trading fails.
 
     Regime indicators:
     1. BTC realized volatility (blocks when in top 30%)

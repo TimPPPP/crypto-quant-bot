@@ -39,9 +39,7 @@ class WindowCircuitBreaker:
     """
     Auto-reduce risk when window performance deteriorates.
 
-    This is a key Phase 1 component for "stopping the bleeding" - preventing
-    windows like Window 5 and Window 11 from contributing excessive losses
-    (-4.64% of -7.45% total = 62% of losses from just 2 windows).
+    Prevents underperforming windows from contributing excessive losses.
 
     De-risk triggers (any condition triggers):
     1. Window P&L < -max_window_loss_pct

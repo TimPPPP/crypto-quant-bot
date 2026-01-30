@@ -2,7 +2,7 @@
 """
 Multi-Timeframe Analysis Module for Pairs Trading Backtest
 
-Issue #4 Fix: 1-minute signals often capture microstructure noise that
+1-minute signals often capture microstructure noise that
 disappears after costs. This module enables systematic comparison across
 timeframes to find where net Sharpe is maximized.
 

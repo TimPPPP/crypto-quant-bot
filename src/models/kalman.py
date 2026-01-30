@@ -170,7 +170,7 @@ class KalmanFilterRegime:
         delta = delta if delta is not None else self.DEFAULT_DELTA
         R = R if R is not None else self.DEFAULT_R
 
-        # Half-life scaled volatility window (Problem #2 fix)
+        # Half-life scaled volatility window
         # If half_life_bars provided and rolling_window not explicitly set,
         # compute rolling_window from half_life for consistent z-score scaling
         if half_life_bars is not None and rolling_window is None:
@@ -213,10 +213,15 @@ class KalmanFilterRegime:
         self.error_history = deque(maxlen=rolling_window)
         self.burn_in = rolling_window
 
+        # Z-score history for inflection point detection (Option C)
+        self.z_history = deque(maxlen=10)  # Last 10 z-scores for derivative calculation
+
         # Track latest values for external access (used by main.py)
         self.latest_z = 0.0
         self.latest_error = 0.0
         self.latest_std = 0.0
+        self.latest_z_velocity = 0.0  # 1st derivative (rate of change)
+        self.latest_z_acceleration = 0.0  # 2nd derivative (change in velocity)
         self.is_warmed_up = False
 
         # Numerical stability bounds
@@ -357,6 +362,7 @@ class KalmanFilterRegime:
             'R': self.R,
             'delta': self.delta,
             'error_history': list(self.error_history),
+            'z_history': list(self.z_history),  # Option C: Save z-score history for inflection detection
             'rolling_window': self.rolling_window,
             'entry_z_threshold': self.entry_z_threshold,
             'min_spread_pct': self.min_spread_pct,
@@ -393,6 +399,11 @@ class KalmanFilterRegime:
             # Restore error history
             for err in state.get('error_history', []):
                 self.error_history.append(err)
+
+            # Restore z-score history (Option C inflection detection)
+            self.z_history = deque(maxlen=10)
+            for z in state.get('z_history', []):
+                self.z_history.append(z)
 
             # Restore thresholds
             self.entry_z_threshold = state.get('entry_z_threshold', self.DEFAULT_ENTRY_Z)

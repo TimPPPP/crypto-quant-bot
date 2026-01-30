@@ -193,7 +193,7 @@ class PositionSizer:
             # power < 1: boost low scores (aggressive)
             normalized = score ** cfg.conviction_power
 
-            # BUG FIX #5: Apply extra penalty for very low scores
+            # Apply extra penalty for very low scores
             if cfg.low_score_harsh_penalty and score < cfg.low_score_threshold:
                 # Linear reduction to near-zero at score=0
                 harsh_mult = score / cfg.low_score_threshold
@@ -306,8 +306,8 @@ class PositionSizer:
                     high_corr_count += 1
 
         # Compute adjustment
-        # BUG FIX #1: Guard against division by zero when threshold >= 1.0
-        # BUG FIX #7: Cleaner penalty logic - compute penalties separately, then combine
+        # Guard against division by zero when threshold >= 1.0
+        # Cleaner penalty logic - compute penalties separately, then combine
         base_penalty = 0.0
         count_penalty = 0.0
 
@@ -386,8 +386,7 @@ class PositionSizer:
         else:
             return 1.0, {"reason": "no_volatility_data"}
 
-        # BUG FIX #6: Explicit NaN check before max()
-        # max(0.001, NaN) = NaN, not 0.001!
+        # Explicit NaN check - max(0.001, NaN) = NaN
         if not np.isfinite(vol) or vol <= 0:
             vol = cfg.vol_floor
         else:
@@ -610,7 +609,7 @@ def compute_position_sizes_vectorized(
 
     elif method == "power":
         normalized = scores ** config.conviction_power
-        # BUG FIX #5: Apply extra penalty for very low scores
+        # Apply extra penalty for very low scores
         if config.low_score_harsh_penalty:
             harsh_mask = scores < config.low_score_threshold
             harsh_mult = scores / config.low_score_threshold
@@ -658,7 +657,7 @@ def compute_position_sizes_vectorized(
         conv_mult = config.conviction_min + (config.conviction_max - config.conviction_min) * scores
 
     # 2. Volatility adjustment (vectorized)
-    # BUG FIX #2: Use min_periods to avoid NaN for early bars, fill remaining NaN
+    # Use min_periods to avoid NaN for early bars, fill remaining NaN
     if config.enable_volatility_targeting and spread_returns is not None:
         lookback = config.volatility_lookback_bars
         # Use expanding window for early bars (min 10 bars or 25% of lookback)
@@ -683,8 +682,7 @@ def compute_position_sizes_vectorized(
         vol_adj = 1.0
 
     # 3. Correlation adjustment (simplified - per-pair static adjustment)
-    # BUG FIX #1 (vectorized): Guard against division by zero
-    # BUG FIX #3: Correct DataFrame broadcasting
+    # Guard against division by zero and ensure correct DataFrame broadcasting
     if config.enable_correlation_adjustment and correlation_matrix is not None:
         # Compute average absolute correlation for each pair
         avg_corr = correlation_matrix.abs().mean()
@@ -700,7 +698,7 @@ def compute_position_sizes_vectorized(
 
         corr_adj = (1.0 - penalty).clip(lower=1.0 - config.correlation_max_penalty)
 
-        # BUG FIX #3: Proper broadcasting - create array then tile to all rows
+        # Proper broadcasting - create array then tile to all rows
         corr_adj_values = np.array([corr_adj.get(pair, 1.0) for pair in scores.columns])
         corr_adj_df = pd.DataFrame(
             np.tile(corr_adj_values, (len(scores), 1)),
@@ -713,7 +711,7 @@ def compute_position_sizes_vectorized(
     # Combine all factors
     position_sizes = config.base_capital_per_pair * conv_mult * vol_adj * corr_adj_df
 
-    # BUG FIX #4: Apply both lower and upper bounds
+    # Apply both lower and upper bounds
     position_sizes = position_sizes.clip(
         lower=config.min_position_size,
         upper=config.max_single_position
@@ -1052,8 +1050,8 @@ def compute_position_sizes_with_features(
     4. Regime-aware sizing
     5. Performance-based adjustment
     6. Drawdown-based sizing
-    7. Risk parity adjustment (Phase 7)
-    8. FINAL hard clamp (Phase 7) - runs LAST, no exceptions
+    7. Risk parity adjustment
+    8. FINAL hard clamp - runs LAST, no exceptions
 
     Parameters
     ----------
@@ -1124,7 +1122,7 @@ def compute_position_sizes_with_features(
             config=config,
         )
 
-    # 5. Risk parity adjustment (Phase 7)
+    # 5. Risk parity adjustment
     # Rebalance positions so each contributes equal volatility to portfolio
     if enable_risk_parity and spread_volatilities is not None:
         position_sizes = apply_risk_parity_sizing(
@@ -1135,7 +1133,7 @@ def compute_position_sizes_with_features(
         )
         logger.debug("Applied risk parity sizing")
 
-    # 6. FINAL HARD CLAMP (Phase 7)
+    # 6. FINAL HARD CLAMP
     # This is the LAST step - no position ever exceeds these limits
     # regardless of what any earlier stage computed
     position_sizes = apply_final_hard_clamp(
@@ -1277,8 +1275,8 @@ def apply_risk_prediction_adjustment(
 
 
 # =============================================================================
-# PHASE 7: POSITION SIZING HARDENING
-# Issue #7 Fix: Add hard clamps after all multipliers, risk parity, and
+# POSITION SIZING HARDENING
+# Add hard clamps after all multipliers, risk parity, and
 # concentration metrics to prevent over-exposure.
 # =============================================================================
 

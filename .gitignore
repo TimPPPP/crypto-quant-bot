@@ -219,3 +219,9 @@ backups/
 
 # QuestDB data (local only)
 data/db/
+
+# Backtest results (large files)
+results/
+
+# Mac resource forks
+._*

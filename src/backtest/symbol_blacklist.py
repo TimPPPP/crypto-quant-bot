@@ -74,9 +74,8 @@ class SymbolBlacklist:
     """
     Track and blacklist consistently underperforming symbols.
 
-    This is a key Phase 1 component for "stopping the bleeding" - identifying
-    symbols like ACE that appear in multiple bottom-performing pairs and
-    excluding them from future windows.
+    Identifies symbols that appear in multiple bottom-performing pairs and
+    excludes them from future windows.
 
     Blacklist criteria (any triggers blacklisting):
     1. Average P&L per window < max_avg_loss_pct

@@ -17,7 +17,7 @@ if not logger.handlers:
 
 @dataclass
 class DataQualityReport:
-    """Report on data quality metrics (Problem #8 fix)."""
+    """Report on data quality metrics ."""
     total_rows: int
     total_gaps: int
     max_gap_minutes: float
@@ -32,7 +32,7 @@ def analyze_data_gaps(df: pd.DataFrame, freq_minutes: float = 1.0) -> DataQualit
     """
     Analyze data gaps and return a quality report.
 
-    Problem #8 Fix: Provides detailed gap analysis to understand data quality
+    Data quality: Provides detailed gap analysis to understand data quality
     issues that can affect Kalman filter assumptions.
 
     Parameters
@@ -108,7 +108,7 @@ def validate_data_continuity(
     """
     Validate data continuity and return quality report.
 
-    Problem #8 Fix: Enhanced validation with detailed reporting.
+    Data quality: Enhanced validation with detailed reporting.
 
     Parameters
     ----------
@@ -182,7 +182,7 @@ def interpolate_small_gaps(
     """
     Interpolate small gaps in price data.
 
-    Problem #8 Fix: For small gaps (e.g., < 5 minutes), interpolation is safer
+    Data quality: For small gaps (e.g., < 5 minutes), interpolation is safer
     than having holes in the data for Kalman filter.
 
     Parameters
@@ -243,7 +243,7 @@ def resample_to_timeframe(
     """
     Resample price data from source timeframe to target timeframe.
 
-    Problem #1 Fix: Aggregate 1-min bars to higher timeframes where
+    Timeframe aggregation: Aggregate 1-min bars to higher timeframes where
     mean-reversion edge exceeds trading friction.
 
     For price data (close prices), we take the last value in each period.
@@ -348,7 +348,7 @@ def load_and_split(
     parquet_path : Path, optional
         Path to parquet file. Default from config.
     signal_timeframe : str, optional
-        Target timeframe for signal generation (Problem #1 fix).
+        Target timeframe for signal generation .
         If None, uses cfg.SIGNAL_TIMEFRAME.
         Set to "1min" to disable resampling.
     strict_validation : bool
@@ -396,22 +396,22 @@ def load_and_split(
     df = df.sort_index()
     _assert_index_sane(df)
 
-    # --- Phase 0.5: Interpolate small gaps (Problem #8 fix) ---
+    # --- Interpolate small gaps  ---
     df, n_interp = interpolate_small_gaps(df)
     if n_interp > 0:
         logger.info("✅ Interpolated %d missing rows before continuity check.", n_interp)
 
-    # --- Phase 1: Safety check on FULL DF (at source timeframe) ---
+    # --- Step 1: Safety check on FULL DF (at source timeframe) ---
     validate_data_continuity(df, strict=strict_validation)
 
-    # --- Phase 1.5: Resample to signal timeframe (Problem #1 fix) ---
+    # --- Step 2: Resample to signal timeframe  ---
     target_tf = signal_timeframe if signal_timeframe is not None else getattr(cfg, "SIGNAL_TIMEFRAME", "1min")
     if target_tf != "1min":
         logger.info("2️⃣ Resampling to signal timeframe: %s", target_tf)
         df = resample_to_timeframe(df, target_tf=target_tf, source_tf="1min")
         _assert_index_sane(df)  # Re-validate after resampling
 
-    # --- Phase 2: Split ---
+    # --- Step 3: Split ---
     n_rows = len(df)
     if n_rows == 0:
         logger.warning("Loaded DataFrame is empty; returning empty train/test.")
@@ -438,7 +438,7 @@ def load_and_split(
         train_df = df.iloc[:split_idx]
         test_df = df.iloc[split_idx:]
 
-    # --- Phase 3: Look-ahead prevention (strict) ---
+    # --- Step 4: Look-ahead prevention (strict) ---
     train_max = train_df.index.max()
     test_min = test_df.index.min()
     if train_max >= test_min:

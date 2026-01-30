@@ -29,6 +29,8 @@ from typing import Dict, Optional, Union, TYPE_CHECKING
 import numpy as np
 import pandas as pd
 
+from src.features.inflection_detector import compute_inflection_mask
+
 from src.backtest import config_backtest as cfg
 
 if TYPE_CHECKING:
@@ -241,20 +243,81 @@ def _bars_per_day(freq: str) -> float:
     return (24.0 * 60.0) / mins
 
 
+def compute_expected_round_trip_cost(
+    bars_per_day: float = 96.0,  # 15-min bars default
+) -> float:
+    """
+    Compute expected round-trip trading cost using actual config values.
+
+    This replaces the hardcoded 28 bps transaction cost with actual config-based costs.
+    Ensures the OU model's expected net profit matches what will be realized in pnl_engine.
+
+    Costs include:
+    - Fees: 4 legs × effective_fee_rate (using FEE_MODEL)
+    - Slippage: 4 legs × SLIPPAGE_RATE
+    - Adverse selection buffer (optional market impact)
+
+    Parameters
+    ----------
+    bars_per_day : float
+        Number of bars per day (for potential future use with vol-adjusted slippage)
+
+    Returns
+    -------
+    float
+        Total expected cost as fraction (e.g., 0.002 = 20 bps)
+    """
+    # 1. Effective fee rate based on FEE_MODEL
+    fee_model = getattr(cfg, "FEE_MODEL", "taker_only")
+    if fee_model == "maker_taker_mix":
+        maker_prob = getattr(cfg, "MAKER_FILL_PROBABILITY", 0.70)
+        maker_rate = getattr(cfg, "MAKER_FEE_RATE", 0.0002)
+        taker_rate = getattr(cfg, "TAKER_FEE_RATE", 0.0005)
+        effective_fee = maker_prob * maker_rate + (1 - maker_prob) * taker_rate
+    elif fee_model == "maker_only":
+        effective_fee = getattr(cfg, "MAKER_FEE_RATE", 0.0002)
+    else:  # taker_only
+        effective_fee = getattr(cfg, "TAKER_FEE_RATE", 0.0005)
+
+    # 2. Slippage rate per leg
+    slippage_rate = getattr(cfg, "SLIPPAGE_RATE", 0.0002)  # 2 bps default
+
+    # 3. Pair trade = 4 legs (2 entry + 2 exit, each leg is one coin)
+    legs = 4
+    total_fee_cost = legs * effective_fee
+    total_slippage_cost = legs * slippage_rate
+
+    # 4. Adverse selection buffer for market impact
+    # Accounts for: partial fills, legging risk, unfavorable fills during volatile spikes
+    adverse_selection_bps = getattr(cfg, "ADVERSE_SELECTION_BPS", 0.0)
+    adverse_selection = adverse_selection_bps / 10_000.0
+
+    total_cost = total_fee_cost + total_slippage_cost + adverse_selection
+
+    logger.debug(
+        "Expected round-trip cost: %.4f (%.1f bps) = fees %.1f bps + slippage %.1f bps + adverse %.1f bps",
+        total_cost, total_cost * 10000,
+        total_fee_cost * 10000, total_slippage_cost * 10000, adverse_selection * 10000
+    )
+
+    return total_cost
+
+
 def compute_ou_expected_profit(
     z_score: pd.DataFrame,
     spread_volatility: pd.DataFrame,
     half_life_bars: Union[float, Dict[str, float], pd.Series],
     *,
     exit_z: float = 0.6,
-    transaction_cost: float = 0.0028,  # 28 bps round-trip
+    transaction_cost: Optional[float] = None,  # None = use config costs
+    use_config_costs: bool = True,  # Use actual config fees/slippage
     funding_cost_per_bar: Optional[Union[float, pd.DataFrame]] = None,
     bars_per_day: float = 1440.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Compute OU-based expected profit that accounts for time-to-revert and costs.
 
-    Problem #4 Fix: The simple expected_profit = vol * 0.75 doesn't account for:
+    OU-based expected profit model: The simple expected_profit = vol * 0.75 doesn't account for:
     - How long it takes to mean-revert (slower = more funding cost)
     - The conditional expectation given current z-score
     - Transaction costs that eat into profit
@@ -263,6 +326,11 @@ def compute_ou_expected_profit(
     - Mean-reversion rate λ = ln(2) / H
     - Expected time to hit exit_z from current z: first-passage time approximation
     - Expected reversion: z * σ * (1 - exp(-λ * τ)) where τ is expected hold time
+
+    Cost-Aware Enhancement:
+    - When use_config_costs=True (default), uses compute_expected_round_trip_cost()
+      to compute actual expected costs from FEE_MODEL, SLIPPAGE_BPS, etc.
+    - This ensures E[net] = E[gross] - (fees + slippage + funding) is realistic
 
     Parameters
     ----------
@@ -277,8 +345,12 @@ def compute_ou_expected_profit(
         - Series with pair names as index
     exit_z : float
         Z-score threshold for exit (mean reversion target)
-    transaction_cost : float
-        Round-trip transaction cost as fraction (e.g., 0.0028 = 28 bps)
+    transaction_cost : float, optional
+        Round-trip transaction cost as fraction. If None:
+        - use_config_costs=True: compute from FEE_MODEL/SLIPPAGE
+        - use_config_costs=False: fallback to 28 bps
+    use_config_costs : bool
+        If True and transaction_cost is None, use compute_expected_round_trip_cost()
     funding_cost_per_bar : float or DataFrame, optional
         Funding cost per bar. If None, uses cfg defaults.
         Can be DataFrame for per-pair funding.
@@ -294,6 +366,17 @@ def compute_ou_expected_profit(
     """
     T, P = z_score.shape
     pairs = z_score.columns
+
+    # Compute transaction cost from config if not provided
+    if transaction_cost is None:
+        if use_config_costs:
+            transaction_cost = compute_expected_round_trip_cost(bars_per_day=bars_per_day)
+            logger.info(
+                "Using config-based transaction cost: %.4f (%.1f bps)",
+                transaction_cost, transaction_cost * 10000
+            )
+        else:
+            transaction_cost = 0.0028  # Legacy fallback: 28 bps
 
     # Convert half_life to per-pair Series
     if isinstance(half_life_bars, (int, float)):
@@ -397,7 +480,7 @@ def compute_masks(
     1. Simple mode (use_ou_model=False, default):
        expected_profit = spread_volatility * EXPECTED_REVERT_MULT
 
-    2. OU model mode (use_ou_model=True, Problem #4 fix):
+    2. OU model mode (use_ou_model=True):
        Uses Ornstein-Uhlenbeck process to compute expected profit that accounts for:
        - Time-to-mean-revert based on half-life
        - Transaction costs
@@ -417,7 +500,7 @@ def compute_masks(
     Parameters
     ----------
     use_ou_model : bool
-        If True, use OU-based expected profit model (Problem #4 fix).
+        If True, use OU-based expected profit model .
         Requires half_life_bars to be provided.
     beta : pd.DataFrame, optional
         Per-pair beta used to align expected profit to return units.
@@ -463,20 +546,20 @@ def compute_masks(
         if half_life_bars is None:
             raise ValueError("half_life_bars is required when use_ou_model=True")
 
-        txn_cost = transaction_cost if transaction_cost is not None else 0.0028  # 28 bps default
         if freq is None:
             freq = getattr(cfg, "SIGNAL_TIMEFRAME", None) or getattr(cfg, "BAR_FREQ", "1min")
         bars_per_day = _bars_per_day(freq)
+        # Let compute_ou_expected_profit use config-based costs if transaction_cost is None
         expected_profit, expected_hold = compute_ou_expected_profit(
             z_score=z_score,
             spread_volatility=spread_volatility,
             half_life_bars=half_life_bars,
             exit_z=exit_z,
-            transaction_cost=txn_cost,
+            transaction_cost=transaction_cost,  # Pass through; None triggers config-based costs
             funding_cost_per_bar=funding_cost_per_bar,
             bars_per_day=bars_per_day,
         )
-        logger.info("Using OU-based expected profit model (Problem #4 fix)")
+        logger.info("Using OU-based expected profit model ")
     else:
         # Simple model (legacy)
         expected_revert_mult = float(
@@ -625,6 +708,43 @@ def compute_masks(
         if max_entry_z is not None:
             entries = entries & (abs_z < max_entry_z)
 
+        # === INFLECTION POINT DETECTION (Option C Redesign) ===
+        # Apply inflection filter if enabled: wait for z-score peak before entry
+        if getattr(cfg, "ENABLE_INFLECTION_FILTER", False):
+            logger.info("Applying inflection point filter...")
+
+            # Apply inflection filter to each pair independently
+            inflection_entries = pd.DataFrame(False, index=z_score.index, columns=z_score.columns)
+
+            for pair in z_score.columns:
+                z_series = z_score[pair].values
+
+                # Compute inflection mask for this pair
+                inflection_mask = compute_inflection_mask(
+                    z_score=z_series,
+                    entry_threshold=entry_z,
+                    min_confidence=getattr(cfg, "INFLECTION_MIN_CONFIDENCE", 0.5),
+                    min_bars_since_extreme=getattr(cfg, "INFLECTION_MIN_BARS_SINCE_EXTREME", 2),
+                    max_bars_since_extreme=getattr(cfg, "INFLECTION_MAX_BARS_SINCE_EXTREME", 10),
+                    velocity_reversal_threshold=getattr(cfg, "INFLECTION_VELOCITY_THRESHOLD", -0.05),
+                )
+
+                inflection_entries[pair] = inflection_mask
+
+            # Count how many signals passed the filter
+            threshold_crosses = (abs_z > entry_z).sum().sum()
+            inflection_passes = inflection_entries.sum().sum()
+
+            logger.info(
+                "Inflection filter: %d/%d signals kept (%.1f%%)",
+                inflection_passes,
+                threshold_crosses,
+                100.0 * inflection_passes / max(1, threshold_crosses),
+            )
+
+            # Require BOTH threshold crossing AND inflection point
+            entries = entries & inflection_entries
+
     # ==========================================================================
     # CONTINUOUS EXPOSURE & DYNAMIC ENTRY (ROI Optimization)
     # ==========================================================================
@@ -634,7 +754,8 @@ def compute_masks(
     # Compute dynamic entry threshold if enabled
     enable_dynamic_entry = bool(getattr(cfg, "ENABLE_DYNAMIC_ENTRY_Z", False))
     if enable_dynamic_entry:
-        txn_cost = transaction_cost if transaction_cost is not None else 0.0028
+        # Use config-based costs if transaction_cost not provided
+        txn_cost = transaction_cost if transaction_cost is not None else compute_expected_round_trip_cost(bars_per_day=bars_per_day)
         dynamic_entry_z_df = compute_dynamic_entry_threshold(
             spread_volatility=spread_volatility,
             cost_per_trade=txn_cost,
@@ -952,7 +1073,7 @@ def apply_cluster_cap(
 
 
 # =============================================================================
-# CARRY FILTER (Issue #5 fix: Funding Selection Bias)
+# CARRY FILTER
 # =============================================================================
 
 def compute_expected_funding_cost(
@@ -967,7 +1088,7 @@ def compute_expected_funding_cost(
     """
     Estimate expected funding cost over holding period.
 
-    Issue #5 Fix: Pairs trading with perpetuals can have systematic funding
+    Funding bias consideration: Pairs trading with perpetuals can have systematic funding
     differentials. This function estimates funding cost to filter bad entries.
 
     For LONG spread (long Y, short X):
@@ -1064,7 +1185,7 @@ def apply_carry_filter(
     """
     Filter entries where expected profit < expected funding cost.
 
-    Issue #5 Fix: Trades that "work" on price movement can still lose
+    Funding bias consideration: Trades that "work" on price movement can still lose
     money due to systematic funding payments.
 
     Parameters
@@ -1153,8 +1274,7 @@ def apply_carry_filter(
 
 
 # =============================================================================
-# OU MODEL V2: CALIBRATED EXPECTED PROFIT (Phase 2 Fix)
-# =============================================================================
+# OU MODEL V2: CALIBRATED EXPECTED PROFIT # =============================================================================
 
 def compute_ou_expected_profit_v2(
     z_score: pd.DataFrame,
@@ -1328,8 +1448,7 @@ def compute_ou_expected_profit_v2(
 
 
 # =============================================================================
-# ENTRY COOLDOWN (Phase 3: Reduce Churn)
-# =============================================================================
+# ENTRY COOLDOWN # =============================================================================
 
 def apply_entry_cooldown(
     entries: pd.DataFrame,
@@ -1404,7 +1523,7 @@ def apply_smart_cooldown(
     freq: str = "15min",
 ) -> pd.DataFrame:
     """
-    Apply different cooldowns based on exit type (Phase 6 - Smart Cooldown).
+    Apply different cooldowns based on exit type .
 
     Exit types have different meanings:
     - Signal exit: Relationship worked, shorter cooldown (3 hours)
@@ -1504,8 +1623,7 @@ def apply_smart_cooldown(
 
 
 # =============================================================================
-# ENTRY QUALITY FILTERS (Phase 6 - Reduce Stop-Loss Hits)
-# =============================================================================
+# ENTRY QUALITY FILTERS # =============================================================================
 
 def apply_slope_filter(
     z_scores: pd.DataFrame,
@@ -1819,7 +1937,7 @@ def apply_entry_quality_filters(
     min_expected_profit_pct: Optional[float] = None,
 ) -> pd.DataFrame:
     """
-    Apply all entry quality filters (Phase 6/7).
+    Apply all entry quality filters .
 
     Combines multiple filters to reduce stop-loss hits and improve signal quality:
     - Slope filter: z must be turning (not still expanding)
@@ -1894,8 +2012,7 @@ def apply_entry_quality_filters(
 
 
 # =============================================================================
-# EXPECTED PROFIT RANKING (Phase 2: Use as ranking, not gate)
-# =============================================================================
+# EXPECTED PROFIT RANKING # =============================================================================
 
 def rank_expected_profits(
     expected_profit: pd.DataFrame,

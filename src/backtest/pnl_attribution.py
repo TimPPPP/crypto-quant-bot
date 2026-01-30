@@ -1,6 +1,6 @@
 # src/backtest/pnl_attribution.py
 """
-P&L Attribution Module for Pairs Trading Backtest (Phase 0)
+P&L Attribution Module for Pairs Trading Backtest
 
 Diagnostic foundation - understand why trades fail.
 

@@ -6,8 +6,8 @@ Numba-accelerated state machine that simulates trade execution,
 tracking entries, exits, fees, slippage, and position sizing.
 
 Supports:
-- Normalized notional sizing (Problem #5 fix)
-- Time-based stops (Problem #7 fix)
+- Normalized notional sizing for consistent returns
+- Time-based stops to prevent holding stale positions
 - Conviction-weighted position sizing
 - Advanced position sizing (non-linear, correlation, volatility targeting)
 """
@@ -277,7 +277,7 @@ class PnlResult:
       Exit reason code at exit timestamps:
         0 = no exit, 1 = signal, 2 = time_stop, 3 = stop_loss, 4 = forced
 
-    P&L Attribution (Phase 0):
+    P&L Attribution:
       gross_pnl_matrix: Gross spread P&L (price movement only, before costs)
       fees_matrix: Total fees paid (4 legs × fee_rate × position_weight)
       slippage_matrix: Total slippage cost (4 legs × slip × position_weight)
@@ -294,7 +294,7 @@ class PnlResult:
     mae_matrix: pd.DataFrame     # max adverse excursion per trade
     mfe_matrix: pd.DataFrame     # max favorable excursion per trade
     exit_reason_matrix: pd.DataFrame  # exit reason codes per trade
-    # P&L Attribution components (Phase 0)
+    # P&L Attribution components
     gross_pnl_matrix: pd.DataFrame   # gross spread P&L before costs
     fees_matrix: pd.DataFrame        # total fees paid
     slippage_matrix: pd.DataFrame    # total slippage cost
@@ -313,7 +313,7 @@ def compute_time_stops_from_half_life(
     """
     Compute per-pair time stop (max hold bars) from half-lives.
 
-    This connects Problem #7 (time stops) with half-life data from pair selection.
+    Connects time stops with half-life data from pair selection.
 
     Parameters
     ----------
@@ -454,14 +454,14 @@ def _pnl_state_machine_numba(
     """
     Truth engine: per-pair blocking state machine.
 
-    Problem #5 Fix: When normalize_notional=True, positions are sized so that
+    When normalize_notional=True, positions are sized so that
     total gross exposure = 1.0 regardless of beta:
         w_Y = 1 / (1 + |beta|)
         w_X = |beta| / (1 + |beta|)
 
-    Problem #7 Fix: Time-based stop via max_hold_bars_arr. If a trade is held
+    Time-based stop via max_hold_bars_arr. If a trade is held
     for longer than max_hold_bars without reverting, it's force-closed.
-    This prevents holding "dead" trades through regime changes.
+    This prevents holding stale trades through regime changes.
 
     Returns
     -------
@@ -499,7 +499,7 @@ def _pnl_state_machine_numba(
     mfe_mat = np.zeros((T, P), dtype=np.float64)  # Max favorable excursion at exit
     exit_reason_mat = np.zeros((T, P), dtype=np.int64)  # Exit reason codes
 
-    # P&L Attribution matrices (Phase 0)
+    # P&L Attribution matrices
     gross_pnl_mat = np.zeros((T, P), dtype=np.float64)  # Gross P&L before costs
     fees_mat = np.zeros((T, P), dtype=np.float64)       # Total fees paid
     slippage_mat = np.zeros((T, P), dtype=np.float64)   # Total slippage cost
@@ -631,7 +631,7 @@ def _pnl_state_machine_numba(
                     if unrealized_pnl > running_mfe[j]:
                         running_mfe[j] = unrealized_pnl
 
-                # Check time stop (Problem #7 fix)
+                # Check time stop
                 bars_held = t - entry_bar[j]
                 max_hold = max_hold_bars_arr[j]
                 time_stop_hit = (max_hold > 0) and (bars_held >= max_hold)
@@ -703,7 +703,7 @@ def _pnl_state_machine_numba(
                     abs_b = abs(b)
 
                     if normalize_notional:
-                        # Problem #5 Fix: Normalized position sizing
+                        # Normalized position sizing
                         # Weights sum to 1.0 for fixed gross exposure
                         denom = 1.0 + abs_b
                         w_y = 1.0 / denom
@@ -906,8 +906,7 @@ def run_pnl_engine(
         If True (default), normalize position weights so gross exposure = 1.0:
             w_Y = 1 / (1 + |beta|)
             w_X = |beta| / (1 + |beta|)
-        This fixes Problem #5: position sizing is truly market-neutral and
-        returns are scale-invariant.
+        Position sizing is truly market-neutral and returns are scale-invariant.
         If False, uses legacy behavior where gross = 1 + |beta|.
 
     max_hold_bars : dict, optional
@@ -915,7 +914,7 @@ def run_pnl_engine(
         E.g., {"ETH-BTC": 1500, "SOL-ETH": 1200}.
         If a pair is not in the dict, uses default_max_hold_bars.
         Set to 0 to disable time stop for that pair.
-        This fixes Problem #7: prevents holding "dead" trades through regime changes.
+        Prevents holding stale trades through regime changes.
 
     default_max_hold_bars : int, optional
         Default time stop for pairs not in max_hold_bars dict.
@@ -973,7 +972,7 @@ def run_pnl_engine(
     fee_rate = float(fee_rate)
     max_trades = int(max_trades_per_pair if max_trades_per_pair is not None else cfg.MAX_TRADES_PER_PAIR)
 
-    # Default to normalized notional (Problem #5 fix)
+    # Default to normalized notional
     if normalize_notional is None:
         normalize_notional = getattr(cfg, 'NORMALIZE_NOTIONAL', True)
 
@@ -988,7 +987,7 @@ def run_pnl_engine(
         stop_loss_pct = getattr(cfg, "STOP_LOSS_PCT", 0.0)
     stop_loss_pct = float(stop_loss_pct)
 
-    # Build per-pair max hold bars array (Problem #7 fix)
+    # Build per-pair max hold bars array
     if default_max_hold_bars is None:
         default_max_hold_bars = getattr(cfg, 'DEFAULT_TIME_STOP_BARS', 1440)
     max_hold_bars = max_hold_bars or {}

@@ -435,10 +435,22 @@ def _apply_real_funding(
     funding_per_bar = net_funding_8h / bars_per_funding_period
     if in_trade is not None:
         in_trade = in_trade.reindex(r.index).fillna(False)
+        # DEBUG: Check how many bars we're in trade
+        n_in_trade = in_trade.sum()
         funding_per_bar = funding_per_bar.where(in_trade, 0.0)
+        logger.info(f"[DEBUG] {pair_name}: in_trade bars={n_in_trade}/{len(in_trade)}, funding_per_bar mean={funding_per_bar[in_trade].mean():.9f}")
+
+    # DEBUG: Log funding impact
+    funding_total = funding_per_bar.fillna(0.0).sum()
+    r_input = r.sum()
 
     # Subtract funding cost from returns (cost is positive, so we subtract)
     r = r - funding_per_bar.fillna(0.0)
+
+    # DEBUG: Check if funding was applied correctly
+    r_output = r.sum()
+    if abs(r_output - r_input) > 1e-9:
+        logger.info(f"[DEBUG] _apply_real_funding {pair_name}: input={r_input:.6f}, funding={funding_total:.6f}, output={r_output:.6f}")
 
     return r
 
@@ -484,12 +496,17 @@ def apply_scenario(
     if in_trade is not None:
         in_trade_mask = in_trade.reindex(r.index).fillna(False).astype(bool)
 
+    # DEBUG: Log input and output
+    input_sum = base_returns.sum()
+
     # IMPORTANT: Identify actual trade exits BEFORE applying funding
     # (funding adjustments make many bars non-zero, but we only want exit events for slippage)
     exit_events = base_returns.fillna(0.0) != 0.0
 
     # Funding: use real rates if available and enabled
-    use_real = getattr(cfg, "USE_REAL_FUNDING", False)
+    # IMPORTANT: Real funding is NOT applied in scenarios! Scenarios use hypothetical funding_drag_daily
+    # for stress testing. Real funding should be tracked separately in PnL attribution.
+    use_real = False  # Disabled: returns_matrix already reflects actual trading P&L
     if use_real and funding_rates is not None and pair_name is not None:
         logger.debug("Applying real funding for pair: %s", pair_name)
         r = _apply_real_funding(r, pair_name, funding_rates, freq, in_trade=in_trade_mask)
@@ -524,6 +541,11 @@ def apply_scenario(
     # Extra slippage only on actual trade exit events (identified BEFORE funding adjustments)
     if extra_slippage_per_exit != 0.0:
         r.loc[exit_events] = r.loc[exit_events] - float(extra_slippage_per_exit)
+
+    # DEBUG: Log if sum changed
+    output_sum = r.sum()
+    if abs(output_sum - input_sum) > 1e-9:
+        logger.info(f"[DEBUG] apply_scenario for {pair_name}: input={input_sum:.6f}, output={output_sum:.6f}, diff={output_sum-input_sum:.6f}")
 
     return r
 
@@ -720,7 +742,17 @@ def generate_performance_report(
     btc_prices = None
     if test_prices is not None and not test_prices.empty:
         if btc_symbol in test_prices.columns:
-            btc_prices = pd.to_numeric(test_prices[btc_symbol], errors="coerce").reindex(returns_matrix.index).ffill()
+            btc_raw = pd.to_numeric(test_prices[btc_symbol], errors="coerce")
+            # Drop duplicates to allow reindex, then ffill
+            btc_deduped = btc_raw[~btc_raw.index.duplicated(keep="first")]
+            # Create a mapping dict for looking up BTC prices
+            btc_deduped = btc_deduped.sort_index().ffill()
+            btc_map = btc_deduped.to_dict()
+            # Map returns_matrix index to BTC prices (handles duplicates)
+            btc_prices = pd.Series(
+                [btc_map.get(ts, None) for ts in returns_matrix.index],
+                index=returns_matrix.index
+            ).ffill()
         else:
             logger.warning("BTC symbol '%s' not found in test_prices columns. Skipping BTC correlation.", btc_symbol)
 
@@ -775,6 +807,9 @@ def generate_performance_report(
         btc_ret = btc_prices.pct_change().fillna(0.0)
         btc_equity = _equity_from_returns(btc_ret, init_cash=1.0)
 
+    # DEBUG: Log returns_matrix before processing
+    logger.info(f"[DEBUG] returns_matrix shape: {returns_matrix.shape}, sum: {returns_matrix.values.sum():.6f}")
+
     # Process each scenario
     for spec in scenarios:
         # Apply scenario transforms per-pair, then sum
@@ -801,12 +836,14 @@ def generate_performance_report(
         # Aggregate portfolio returns (sum across pairs)
         portfolio_returns_df = pd.DataFrame(pair_returns_with_costs)
 
-        # Apply position size multiplier to weight returns
-        # Each pair's return is multiplied by its position size multiplier
-        for pair_name in portfolio_returns_df.columns:
-            if pair_name in pos_mult.columns:
-                pair_mult = pos_mult[pair_name].reindex(portfolio_returns_df.index).fillna(1.0)
-                portfolio_returns_df[pair_name] = portfolio_returns_df[pair_name] * pair_mult
+        # DEBUG: Calculate total funding impact
+        total_funding_impact = portfolio_returns_df.values.sum() - returns_matrix.values.sum()
+        logger.info(f"[DEBUG] Scenario '{spec.name}': Total funding impact = {total_funding_impact:.6f}")
+
+        # NOTE: Do NOT multiply by position_size_multiplier here!
+        # The returns_matrix already includes position sizing from the PnL engine
+        # (see pnl_engine.py line 820: returns_mat[t, j] = (net_pnl / capital_per_pair) * size_mult)
+        # Multiplying again would cause double-counting of position sizes.
 
         # In realistic simulation mode, scale returns by position allocation
         # Each position gets (1 / max_positions) of capital, then scaled by risk multiplier
@@ -819,6 +856,10 @@ def generate_performance_report(
             portfolio_returns_df = portfolio_returns_df * alloc_per_pos
 
         r_s = portfolio_returns_df.sum(axis=1).astype(float).fillna(0.0)
+
+        # DEBUG: Log what we're computing
+        logger.info(f"[DEBUG] Scenario '{spec.name}': r_s sum = {r_s.sum():.6f}, len = {len(r_s)}")
+        logger.info(f"[DEBUG] portfolio_returns_df shape: {portfolio_returns_df.shape}, sum: {portfolio_returns_df.values.sum():.6f}")
 
         scenario_returns[spec.name] = r_s
 

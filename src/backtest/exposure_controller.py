@@ -1,6 +1,6 @@
 # src/backtest/exposure_controller.py
 """
-Exposure Controller (Phase 6) - Systematic capital deployment.
+Exposure Controller - Systematic capital deployment.
 
 This module manages target exposure and position scaling to minimize idle capital.
 When the strategy has valid signals but low exposure, it scales up positions.

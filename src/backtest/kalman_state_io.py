@@ -141,7 +141,7 @@ def compute_warm_states(
     pair_half_lives : dict, optional
         Per-pair half-life in bars, e.g., {"ETH-BTC": 500.0}.
         If provided, the volatility window will be scaled from half-life
-        for more consistent z-score behavior (Problem #2 fix).
+        for more consistent z-score behavior.
     delta : float, optional
         Kalman process noise (default from config)
     R : float, optional
@@ -253,7 +253,7 @@ def compute_warm_states(
         if rolling_window is not None:
             rw = rolling_window
         elif half_life is not None:
-            # Scale window from half-life (Problem #2 fix)
+            # Scale window from half-life
             rw = None  # Let KalmanFilterRegime compute it
         else:
             rw = cfg.LOOKBACK_WINDOW
